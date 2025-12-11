@@ -2,7 +2,7 @@
 # @time:10/19/25 10:12
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
-# @File:beck.py
+# @File:backends.py
 
 from __future__ import annotations
 from typing import Dict, Optional
@@ -23,6 +23,14 @@ try:
     from qiskit.quantum_info import Statevector
 except Exception:
     Statevector = None  # type: ignore
+
+# IBM Runtime imports (optional)
+try:
+    from qiskit_ibm_runtime import QiskitRuntimeService, Session, SamplerV2
+except Exception:
+    QiskitRuntimeService = None  # type: ignore
+    Session = None  # type: ignore
+    SamplerV2 = None  # type: ignore
 
 
 class SamplerBackend:
@@ -128,37 +136,57 @@ class LocalSimulatorBackend(SamplerBackend):
         return _normalize_counts_to_total(dict(counts), self.shots)
 
 
+# ----------------------------------------------------------------------
+# Global IBM Runtime state: one service + one session + one backend
+# shared by all IBMSamplerBackend instances.
+# ----------------------------------------------------------------------
+
+_GLOBAL_IBM_SERVICE = None
+_GLOBAL_IBM_SESSION = None
+_GLOBAL_IBM_BACKEND = None
+
+
 class IBMSamplerBackend(SamplerBackend):
     """
     IBM Runtime SamplerV2 backend with explicit lowering and routing to the target backend.
+
+    This implementation reuses a single QiskitRuntimeService and Session across all
+    IBMSamplerBackend instances in the process, so the entire sampling workflow
+    effectively runs inside one long-lived session, with grouped sampling on top.
     """
     def __init__(self, shots: int, backend_name: Optional[str]):
         super().__init__(shots)
-        try:
-            from qiskit_ibm_runtime import QiskitRuntimeService, Session, SamplerV2
-        except Exception as e:
-            raise RuntimeError("qiskit-ibm-runtime must be installed to use IBM backends.") from e
 
-        self._service = QiskitRuntimeService()
-        if backend_name:
-            backend = self._service.backend(backend_name)
-        else:
-            backend = self._service.least_busy(operational=True, simulator=False)
-        self._backend = backend
-        self._session = Session(backend=backend)
+        if QiskitRuntimeService is None or Session is None or SamplerV2 is None:
+            raise RuntimeError("qiskit-ibm-runtime (with SamplerV2) must be installed to use IBM backends.")
+
+        global _GLOBAL_IBM_SERVICE, _GLOBAL_IBM_SESSION, _GLOBAL_IBM_BACKEND
+
+        # Initialize or reuse a single QiskitRuntimeService
+        if _GLOBAL_IBM_SERVICE is None:
+            _GLOBAL_IBM_SERVICE = QiskitRuntimeService()
+        self._service = _GLOBAL_IBM_SERVICE
+
+        # Initialize or reuse a single backend + session
+        if _GLOBAL_IBM_SESSION is None or _GLOBAL_IBM_BACKEND is None:
+            # First time: choose backend and open a session
+            if backend_name:
+                backend = self._service.backend(backend_name)
+            else:
+                backend = self._service.least_busy(operational=True, simulator=False)
+            _GLOBAL_IBM_BACKEND = backend
+            _GLOBAL_IBM_SESSION = Session(backend=backend)
+
+        self._backend = _GLOBAL_IBM_BACKEND
+        self._session = _GLOBAL_IBM_SESSION
+
+        # Create SamplerV2 bound to the shared session
         self._sampler = SamplerV2(
             mode=self._session,
             options={
                 "default_shots": shots,
             },
         )
-
-    def __del__(self):
-        try:
-            if hasattr(self, "_session") and self._session is not None:
-                self._session.close()
-        except Exception:
-            pass
 
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
         # Expand library gates and then transpile to the target backend's native gate set and coupling map
@@ -227,4 +255,3 @@ def make_backend(kind: str, shots: int, seed_sim: Optional[int], ibm_backend: Op
         return IBMSamplerBackend(shots=shots, backend_name=ibm_backend)
     else:
         raise ValueError(f"Unknown backend kind: {kind}")
-
