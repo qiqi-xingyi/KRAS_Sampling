@@ -235,6 +235,7 @@ def per_example_sampling(task_label: str, pdbid: str, sequence: str) -> str:
 
 
 if __name__ == "__main__":
+
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     # This line ensures local credentials are loaded; we don't pass `service` further
