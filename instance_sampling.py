@@ -1,5 +1,5 @@
 # --*-- conding:utf-8 --*--
-# @time:10/23/25 14:47
+# @time:12/10/25 22:58
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:instance_sampling.py
@@ -31,11 +31,12 @@ REPS: int = 1
 GROUP_COUNT = 10
 SHOTS_PER_GROUP = 2000
 
-OUTPUT_ROOT = Path("sampling_results")  # Root directory for results
+OUTPUT_ROOT = Path("sampling_results")
 
 
 def read_ibm_config(path: str) -> Dict[str, str]:
-    cfg: Dict[str, str] = {}
+    """Read backend and instance only. Token is NOT used."""
+    cfg = {}
     try:
         with open(path, "r") as f:
             for line in f:
@@ -43,27 +44,24 @@ def read_ibm_config(path: str) -> Dict[str, str]:
                     continue
                 key, value = line.strip().split("=", 1)
                 cfg[key.strip().upper()] = value.strip()
-    except Exception as e:
-        print(f"Failed to read IBM config: {e}")
+    except Exception:
+        pass
     return cfg
 
 
 cfg_data = read_ibm_config(IBM_CONFIG_FILE)
-IBM_TOKEN = cfg_data.get("TOKEN", "")
+
 IBM_INSTANCE = cfg_data.get("INSTANCE", None)
 IBM_BACKEND_NAME = cfg_data.get("BACKEND", None)
 
 
 def init_ibm_service() -> QiskitRuntimeService:
-    if IBM_TOKEN:
-        try:
-            return QiskitRuntimeService(
-                channel="ibm_quantum_platform",
-                token=IBM_TOKEN,
-                instance=IBM_INSTANCE
-            )
-        except Exception:
-            return QiskitRuntimeService()
+    """
+    Initialize QiskitRuntimeService using *only* locally saved IBM token.
+    Token must have been saved previously via save_account().
+    """
+    if IBM_INSTANCE:
+        return QiskitRuntimeService(instance=IBM_INSTANCE)
     return QiskitRuntimeService()
 
 
@@ -84,6 +82,7 @@ def build_protein_hamiltonian(sequence: str, penalties: Tuple[int, int, int]) ->
 def read_tasks(path: str) -> List[Dict[str, str]]:
     df = pd.read_csv(path)
     cols = [c.lower() for c in df.columns]
+
     if "protein_name" in cols:
         pn_col = df.columns[cols.index("protein_name")]
     elif "pdbid" in cols:
@@ -93,16 +92,16 @@ def read_tasks(path: str) -> List[Dict[str, str]]:
     elif "protein" in cols:
         pn_col = df.columns[cols.index("protein")]
     else:
-        raise ValueError("Input must contain column: protein_name / pdbid / pdb_id / protein")
+        raise ValueError("Column protein_name / pdbid / pdb_id / protein is required")
 
     if "main_chain_residue_seq" in cols:
         seq_col = df.columns[cols.index("main_chain_residue_seq")]
     elif "sequence" in cols:
         seq_col = df.columns[cols.index("sequence")]
     else:
-        raise ValueError("Input must contain column: main_chain_residue_seq or sequence")
+        raise ValueError("Column main_chain_residue_seq or sequence is required")
 
-    tasks: List[Dict[str, str]] = []
+    tasks = []
     for _, row in df.iterrows():
         protein_name = str(row[pn_col]).strip()
         sequence = str(row[seq_col]).strip()
@@ -119,8 +118,8 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
 
     H = build_protein_hamiltonian(sequence, PENALTY_PARAMS)
 
-    group_csvs: List[str] = []
-    timing_rows: List[Dict[str, Any]] = []
+    group_csvs = []
+    timing_rows = []
     t0_total = time.perf_counter()
 
     for group_id in range(GROUP_COUNT):
@@ -136,7 +135,7 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
             backend=BackendConfig(
                 kind="ibm",
                 shots=SHOTS_PER_GROUP,
-                seed_sim=None,  # Running on real backend, not simulator
+                seed_sim=None,
                 ibm_backend=IBM_BACKEND_NAME,
             ),
             out_csv=str(out_dir / f"samples_{protein_name}_group{group_id}_ibm.csv"),
@@ -153,63 +152,62 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
         t0 = time.perf_counter()
         df = runner.run()
         t1 = time.perf_counter()
-        elapsed = t1 - t0
 
-        print(f"[Group {group_id}] wrote {len(df)} rows -> {cfg.out_csv} (time: {elapsed:.2f}s)")
+        elapsed = t1 - t0
+        print(f"[Group {group_id}] {len(df)} rows -> {cfg.out_csv} ({elapsed:.2f}s)")
+
         group_csvs.append(cfg.out_csv)
         timing_rows.append({
             "protein_name": protein_name,
             "group_id": group_id,
             "run_seed": run_seed,
-            "rows": int(len(df)),
+            "rows": len(df),
             "seconds": round(elapsed, 6),
         })
 
     total_elapsed = time.perf_counter() - t0_total
     timing_df = pd.DataFrame(timing_rows)
     timing_df["total_seconds_for_protein"] = round(total_elapsed, 6)
-    timing_csv = out_dir / f"{protein_name}_timing.csv"
-    timing_df.to_csv(timing_csv, index=False)
-    print(f"[Timing] -> {timing_csv} (total: {total_elapsed:.2f}s)")
+    timing_df.to_csv(out_dir / f"{protein_name}_timing.csv", index=False)
 
+    # merge per-group CSVs
     combined = []
     for fpath in group_csvs:
         try:
-            df = pd.read_csv(fpath)
-            combined.append(df)
-        except Exception:
+            combined.append(pd.read_csv(fpath))
+        except:
             pass
+
     if combined:
         all_df = pd.concat(combined, ignore_index=True)
-        merged_csv = out_dir / f"samples_{protein_name}_all_ibm.csv"
-        all_df.to_csv(merged_csv, index=False)
-        print(f"[Merged] {protein_name}: {len(all_df)} rows -> {merged_csv}")
-        return str(merged_csv)
+        out_path = out_dir / f"samples_{protein_name}_all_ibm.csv"
+        all_df.to_csv(out_path, index=False)
+        print(f"[Merged] {protein_name}: {len(all_df)} rows -> {out_path}")
+        return str(out_path)
     return ""
 
 
 if __name__ == "__main__":
-
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Use ONLY locally saved IBM token
     service = init_ibm_service()
 
-    EXAMPLES: List[Dict[str, Any]] = read_tasks(TASKS_FILE)
+    EXAMPLES = read_tasks(TASKS_FILE)
 
     all_combined = []
     for ex in EXAMPLES:
         merged_path = per_example_sampling(ex["protein_name"], ex["main_chain_residue_seq"])
         if merged_path:
             try:
-                df = pd.read_csv(merged_path)
-                all_combined.append(df)
-            except Exception:
+                all_combined.append(pd.read_csv(merged_path))
+            except:
                 pass
 
-
     if all_combined:
-        all_df = pd.concat(all_combined, ignore_index=True)
-        out_all = OUTPUT_ROOT / "samples_all_ibm.csv"
-        all_df.to_csv(out_all, index=False)
-        print(f"\n[Global merged] all proteins -> {out_all} ({len(all_df)} rows)")
+        final_df = pd.concat(all_combined, ignore_index=True)
+        final_path = OUTPUT_ROOT / "samples_all_ibm.csv"
+        final_df.to_csv(final_path, index=False)
+        print(f"\n[Global merged] {len(final_df)} rows -> {final_path}")
 
     print("\nAll sampling runs completed.")
