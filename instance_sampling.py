@@ -2,7 +2,7 @@
 # @time:10/23/25 14:47
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
-# @File:instance_sampling_group_1.py
+# @File:instance_sampling.py
 
 import time
 import random
