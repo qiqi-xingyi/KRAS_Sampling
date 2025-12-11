@@ -4,6 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:instance_sampling.py
 
+
 import time
 import random
 from typing import Dict, Any, List, Tuple
@@ -20,7 +21,6 @@ from Protein_Folding.penalty_parameters import PenaltyParameters
 from Protein_Folding.protein_folding_problem import ProteinFoldingProblem
 
 
-IBM_CONFIG_FILE = "./ibm_config.txt"
 TASKS_FILE = "./tasks.csv"
 
 PENALTY_PARAMS: Tuple[int, int, int] = (10, 10, 10)
@@ -33,35 +33,26 @@ SHOTS_PER_GROUP = 2000
 
 OUTPUT_ROOT = Path("sampling_results")
 
-
-def read_ibm_config(path: str) -> Dict[str, str]:
-    """Read backend and instance only. Token is NOT used."""
-    cfg = {}
-    try:
-        with open(path, "r") as f:
-            for line in f:
-                if "=" not in line:
-                    continue
-                key, value = line.strip().split("=", 1)
-                cfg[key.strip().upper()] = value.strip()
-    except Exception:
-        pass
-    return cfg
-
-
-cfg_data = read_ibm_config(IBM_CONFIG_FILE)
-
-IBM_INSTANCE = cfg_data.get("INSTANCE", None)
-IBM_BACKEND_NAME = cfg_data.get("BACKEND", None)
+# If you want to fix a backend, put its name here; otherwise set to None
+IBM_BACKEND_NAME: str | None = "ibm_brisbane"  # or None to let SamplingRunner decide
 
 
 def init_ibm_service() -> QiskitRuntimeService:
     """
-    Initialize QiskitRuntimeService using *only* locally saved IBM token.
-    Token must have been saved previously via save_account().
+    Initialize QiskitRuntimeService using ONLY the locally saved IBM account.
+
+    Before running this script, make sure you have run once (in this env):
+
+        from qiskit_ibm_runtime import QiskitRuntimeService
+        QiskitRuntimeService.save_account(
+            channel="ibm_quantum_platform",
+            token="YOUR_TOKEN",
+            instance="hub/group/project",
+            overwrite=True,
+        )
+
+    After that, QiskitRuntimeService() will load credentials from local storage.
     """
-    if IBM_INSTANCE:
-        return QiskitRuntimeService(instance=IBM_INSTANCE)
     return QiskitRuntimeService()
 
 
@@ -101,12 +92,15 @@ def read_tasks(path: str) -> List[Dict[str, str]]:
     else:
         raise ValueError("Column main_chain_residue_seq or sequence is required")
 
-    tasks = []
+    tasks: List[Dict[str, str]] = []
     for _, row in df.iterrows():
         protein_name = str(row[pn_col]).strip()
         sequence = str(row[seq_col]).strip()
         if protein_name and sequence:
-            tasks.append({"protein_name": protein_name, "main_chain_residue_seq": sequence})
+            tasks.append({
+                "protein_name": protein_name,
+                "main_chain_residue_seq": sequence
+            })
     return tasks
 
 
@@ -118,8 +112,8 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
 
     H = build_protein_hamiltonian(sequence, PENALTY_PARAMS)
 
-    group_csvs = []
-    timing_rows = []
+    group_csvs: List[str] = []
+    timing_rows: List[Dict[str, Any]] = []
     t0_total = time.perf_counter()
 
     for group_id in range(GROUP_COUNT):
@@ -169,13 +163,14 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
     timing_df = pd.DataFrame(timing_rows)
     timing_df["total_seconds_for_protein"] = round(total_elapsed, 6)
     timing_df.to_csv(out_dir / f"{protein_name}_timing.csv", index=False)
+    print(f"[Timing] total: {total_elapsed:.2f}s")
 
-    # merge per-group CSVs
+    # merge group CSVs
     combined = []
     for fpath in group_csvs:
         try:
             combined.append(pd.read_csv(fpath))
-        except:
+        except Exception:
             pass
 
     if combined:
@@ -190,10 +185,10 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
 if __name__ == "__main__":
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    # Use ONLY locally saved IBM token
+    # This line ensures local credentials are loaded; we don't pass `service` further
     service = init_ibm_service()
 
-    EXAMPLES = read_tasks(TASKS_FILE)
+    EXAMPLES: List[Dict[str, Any]] = read_tasks(TASKS_FILE)
 
     all_combined = []
     for ex in EXAMPLES:
@@ -201,7 +196,7 @@ if __name__ == "__main__":
         if merged_path:
             try:
                 all_combined.append(pd.read_csv(merged_path))
-            except:
+            except Exception:
                 pass
 
     if all_combined:
