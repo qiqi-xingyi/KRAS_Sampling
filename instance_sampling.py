@@ -39,7 +39,7 @@ SHOTS_PER_GROUP = 2000
 OUTPUT_ROOT = Path("KRAS_sampling_results")
 
 # If you want to fix a backend, put its name here; otherwise set to None
-IBM_BACKEND_NAME: str | None = "ibm_brisbane"  # or None to let SamplingRunner decide
+IBM_BACKEND_NAME: str | None = "ibm_cleveland"  # or None to let SamplingRunner decide
 
 
 def init_ibm_service() -> QiskitRuntimeService:
