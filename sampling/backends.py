@@ -247,7 +247,6 @@ class IBMSamplerBackend(SamplerBackend):
 
         raise RuntimeError("Unsupported SamplerV2 result format; cannot extract counts.")
 
-
 def make_backend(kind: str, shots: int, seed_sim: Optional[int], ibm_backend: Optional[str]) -> SamplerBackend:
     kind = (kind or "simulator").lower()
     if kind == "simulator":
