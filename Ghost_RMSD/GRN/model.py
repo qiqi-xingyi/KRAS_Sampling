@@ -4,7 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:model.py
 
-# GRN/model.py
 from typing import List, Optional, Dict
 
 import torch
