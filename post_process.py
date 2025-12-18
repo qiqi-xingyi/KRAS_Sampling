@@ -59,40 +59,50 @@ def _match_any(name: str, patterns: List[str]) -> bool:
 
 def infer_protein_id(src_dir: Path) -> str:
     """
-    Infer protein_id for output folder naming.
-    Priority:
-      1) read one row from a samples_*.csv (or any *.csv) and use column 'pdbid' if present
-      2) fallback: column 'protein' if present
-      3) fallback: parse folder name like 'KRAS_4LPK_WT_1' -> '4LPK_WT'
-      4) fallback: folder name itself
+    Return a UNIQUE id per pocket:
+      - Use CSV column 'pdbid' or 'protein' as base id (e.g., 4LPK_WT)
+      - If folder name is like KRAS_4LPK_WT_1, append pocket suffix -> 4LPK_WT_1
     """
-    # 1) find a csv to probe
+    name = src_dir.name.strip()
+
+    # pocket suffix from folder name, e.g. KRAS_4LPK_WT_1 -> ("4LPK_WT", "1")
+    pocket_m = re.match(r"^KRAS_([0-9A-Za-z]{4}_[0-9A-Za-z]+)_(\d+)$", name)
+    pocket_suffix = None
+    if pocket_m:
+        pocket_suffix = pocket_m.group(2)  # "1" / "2" / "3"
+
+    # 1) try read base id from CSV
     csvs = sorted(src_dir.glob("samples_*.csv"))
     if not csvs:
         csvs = sorted(src_dir.glob("*.csv"))
 
+    base_id = None
     if csvs:
         try:
             df0 = pd.read_csv(csvs[0], nrows=1)
             if "pdbid" in df0.columns and len(df0) > 0:
                 v = str(df0.loc[0, "pdbid"]).strip()
                 if v and v.lower() != "nan":
-                    return v
-            if "protein" in df0.columns and len(df0) > 0:
+                    base_id = v
+            if base_id is None and "protein" in df0.columns and len(df0) > 0:
                 v = str(df0.loc[0, "protein"]).strip()
                 if v and v.lower() != "nan":
-                    return v
+                    base_id = v
         except Exception:
-            pass
+            base_id = None
 
-    # 2) parse folder name: KRAS_4LPK_WT_1 -> 4LPK_WT
-    name = src_dir.name.strip()
-    m = re.match(r"^KRAS_([0-9A-Za-z]{4}_[0-9A-Za-z]+)_(\d+)$", name)
-    if m:
-        return f"{m.group(1)}_{m.group(2)}"  # 4LPK_WT_1 / 4LPK_WT_2 / 4LPK_WT_3
+    # If we got base_id from CSV, append pocket suffix if available
+    if base_id is not None:
+        if pocket_suffix is not None:
+            return f"{base_id}_{pocket_suffix}"
+        return base_id
 
-    # 3) fallback
+    # 2) fallback: derive from folder name directly
+    if pocket_m:
+        return f"{pocket_m.group(1)}_{pocket_m.group(2)}"
+
     return name
+
 
 
 def stage_input(src_dir: Path, staging_dir: Path, prefix: str, use_symlink: bool = True) -> None:
