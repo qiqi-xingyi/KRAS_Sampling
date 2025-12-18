@@ -21,7 +21,7 @@ from qsadpp.orchestrator import OrchestratorConfig, PipelineOrchestrator
 from qsadpp.io_reader import ReaderOptions
 from qsadpp.feature_calculator import FeatureConfig
 
-BASE_DIR = Path("./quantum_data")
+BASE_DIR = Path("./KRAS_sampling_results")
 OUT_ROOT = Path("./pp_result")
 STAGING_ROOT = OUT_ROOT / "_staging"
 
