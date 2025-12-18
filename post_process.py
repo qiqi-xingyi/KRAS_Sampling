@@ -89,7 +89,7 @@ def infer_protein_id(src_dir: Path) -> str:
     name = src_dir.name.strip()
     m = re.match(r"^KRAS_([0-9A-Za-z]{4}_[0-9A-Za-z]+)_(\d+)$", name)
     if m:
-        return m.group(1)
+        return f"{m.group(1)}_{m.group(2)}"  # 4LPK_WT_1 / 4LPK_WT_2 / 4LPK_WT_3
 
     # 3) fallback
     return name
