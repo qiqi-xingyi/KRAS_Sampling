@@ -4,7 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:data.py
 
-# GRN/data.py
 import json
 import math
 from pathlib import Path
