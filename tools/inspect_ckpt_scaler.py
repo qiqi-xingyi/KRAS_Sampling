@@ -75,7 +75,7 @@ def main() -> None:
     ap.add_argument(
         "--ckpt",
         type=str,
-        default="Ghost_RMSD/checkpoints_full/grn_best.pt",
+        default="/Users/yuqizhang/Desktop/Code/KRAS_QSAD/Ghost_RMSD/checkpoints_full/grn_best.pt",
         help="Path to the GRN checkpoint (.pt).",
     )
     ap.add_argument(
