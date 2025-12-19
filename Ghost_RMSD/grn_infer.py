@@ -4,11 +4,13 @@
 # @Email : yzhan135@kent.edu
 # @File:grn_infer.py
 
-
 # GRN inference wrapper that is fully checkpoint-driven:
-# - Model architecture (hidden_dims) inferred from ckpt["model_state"] backbone weights
-# - dropout / score_mode / use_rank_head / (optional) batch_size taken from ckpt["args"] when present
-# - scaler taken from ckpt["scaler"] if usable; otherwise rebuilt from dict; otherwise identity
+# - Model architecture inferred from ckpt["model_state"] backbone weights when possible
+# - dropout / score_mode / use_rank_head / batch_size taken from ckpt["args"] when present
+# - scaler taken from ckpt["scaler"]:
+#     * supports sklearn-like scaler objects with .transform
+#     * supports dict(mean_/scale_) or dict(mean/std) arrays
+#     * supports per-feature dict: {"E_total": {"mean":..., "std":...}, ...}
 # - Base/sequence feature names taken from ckpt["base_feature_names"] / ckpt["seq_feature_names"]
 #
 # Required input columns in JSONL/DF:
@@ -111,12 +113,73 @@ def _make_identity_scaler(expected_dim: int):
     return _Id(expected_dim)
 
 
-def _rebuild_scaler_if_needed(scaler_obj: Any, expected_dim: int) -> Any:
+def _make_lite_scaler(mean_arr: np.ndarray, scale_arr: np.ndarray):
+    class _Lite:
+        def __init__(self, mean_: np.ndarray, scale_: np.ndarray):
+            self.mean_ = mean_.astype(float, copy=True)
+            s = scale_.astype(float, copy=True)
+            self.scale_ = np.where(s == 0, 1.0, s)
+            self.n_features_in_ = int(self.mean_.shape[0])
+
+        def transform(self, X):
+            return (X - self.mean_) / self.scale_
+
+    return _Lite(mean_arr, scale_arr)
+
+
+def _make_per_feature_scaler(
+    feature_names: List[str],
+    per_feature: Dict[str, Any],
+) -> Any:
+    """
+    Build a scaler from:
+      {"E_total": {"mean":..., "std":...}, ...}
+    aligned to feature_names order.
+    """
+    mean = np.zeros((len(feature_names),), dtype=float)
+    std = np.ones((len(feature_names),), dtype=float)
+
+    for i, fn in enumerate(feature_names):
+        if fn not in per_feature:
+            raise KeyError(f"Checkpoint scaler missing feature '{fn}'")
+        entry = per_feature[fn]
+        if isinstance(entry, dict):
+            m = entry.get("mean", entry.get("mean_", None))
+            s = entry.get("std", entry.get("std_", entry.get("scale", entry.get("scale_", None))))
+            if m is None or s is None:
+                raise ValueError(f"Scaler entry for '{fn}' must contain mean/std (got keys={list(entry.keys())})")
+            mean[i] = float(m)
+            std[i] = float(s)
+        else:
+            raise ValueError(f"Scaler entry for '{fn}' must be a dict(mean/std), got {type(entry)}")
+
+    # Prefer sklearn StandardScaler when available, else lite scaler.
+    try:
+        from sklearn.preprocessing import StandardScaler
+        s = StandardScaler()
+        s.mean_ = mean
+        s.scale_ = np.where(std == 0, 1.0, std)
+        s.var_ = s.scale_ ** 2
+        s.n_features_in_ = int(mean.shape[0])
+        return s
+    except Exception:
+        return _make_lite_scaler(mean, std)
+
+
+def _rebuild_scaler_if_needed(
+    scaler_obj: Any,
+    expected_dim: int,
+    feature_names: Optional[List[str]] = None,
+) -> Any:
     """
     Prefer:
-      1) A deserialized sklearn-like scaler with .transform
-      2) A dict with mean_/scale_ (rebuild StandardScaler or lite scaler)
-      3) Identity scaler
+      1) A scaler object with .transform
+      2) A dict with mean_/scale_ arrays (rebuild StandardScaler or lite scaler)
+      3) A per-feature dict keyed by feature name: {feat: {mean,std}, ...}
+      4) Identity scaler
+
+    NOTE:
+      For per-feature dict, feature_names must be provided and length must match expected_dim.
     """
     if hasattr(scaler_obj, "transform"):
         return scaler_obj
@@ -129,42 +192,54 @@ def _rebuild_scaler_if_needed(scaler_obj: Any, expected_dim: int) -> Any:
         if "state" in d and isinstance(d["state"], dict):
             d = d["state"]
 
+        # Case A: per-feature dict keyed by feature name
+        # Example:
+        #   {"E_total": {"mean":..., "std":...}, "E_steric": {...}, ...}
+        if feature_names is not None and len(feature_names) == expected_dim:
+            if all((fn in d and isinstance(d.get(fn), dict)) for fn in feature_names):
+                return _make_per_feature_scaler(feature_names, d)
+
+        # Case B: array-form mean/scale
         def _arr(key: str):
             v = d.get(key, None)
             if v is None:
                 return None
             return np.asarray(v, dtype=float)
 
-        mean = _arr("mean_") or _arr("mean") or _arr("center_") or _arr("center")
-        scale = _arr("scale_") or _arr("scale") or _arr("std") or _arr("std_")
+        mean = _arr("mean_") if _arr("mean_") is not None else _arr("mean")
+        if mean is None:
+            mean = _arr("center_") if _arr("center_") is not None else _arr("center")
+        scale = _arr("scale_") if _arr("scale_") is not None else _arr("scale")
+        if scale is None:
+            scale = _arr("std") if _arr("std") is not None else _arr("std_")
 
         if mean is not None and scale is not None:
+            if int(mean.shape[0]) != expected_dim:
+                raise ValueError(f"Scaler mean dim mismatch: got {int(mean.shape[0])}, expected {expected_dim}")
+            if int(scale.shape[0]) != expected_dim:
+                raise ValueError(f"Scaler scale/std dim mismatch: got {int(scale.shape[0])}, expected {expected_dim}")
             try:
                 from sklearn.preprocessing import StandardScaler
                 s = StandardScaler()
                 s.mean_ = mean
-                s.scale_ = scale
-                s.var_ = (scale ** 2)
+                s.scale_ = np.where(scale == 0, 1.0, scale)
+                s.var_ = s.scale_ ** 2
                 s.n_features_in_ = int(mean.shape[0])
                 return s
             except Exception:
-                class _Lite:
-                    def __init__(self, mean_arr: np.ndarray, scale_arr: np.ndarray):
-                        self.mean_ = mean_arr
-                        self.scale_ = np.where(scale_arr == 0, 1.0, scale_arr)
-                        self.n_features_in_ = int(mean_arr.shape[0])
+                return _make_lite_scaler(mean, scale)
 
-                    def transform(self, X):
-                        return (X - self.mean_) / self.scale_
-
-                return _Lite(mean, scale)
-
+        # Case C: explicit identity requested via dict flag
         feat_names = d.get("feature_names_", None)
         if isinstance(feat_names, (list, tuple)) and len(feat_names) == expected_dim:
             return _make_identity_scaler(expected_dim)
 
-    print("[WARN] Unrecognized scaler in checkpoint; using identity transform.")
-    return _make_identity_scaler(expected_dim)
+    # If we reach here, we cannot interpret scaler safely.
+    raise ValueError(
+        "Unrecognized scaler format in checkpoint. "
+        "Refusing to silently fall back to identity. "
+        "Please inspect ckpt['scaler'] and update parser accordingly."
+    )
 
 
 def _ensure_base_features(df: pd.DataFrame, base_feature_names: List[str]) -> pd.DataFrame:
@@ -286,7 +361,7 @@ class GRNInferencer:
     Checkpoint-driven wrapper for GRN inference.
 
     Typical usage:
-        inf = GRNInferencer(ckpt="checkpoints_full/grn_best.pt")
+        inf = GRNInferencer(ckpt="Ghost_RMSD/checkpoints_full/grn_best.pt")
         df_ranked = inf.predict_jsonl("prepared_dataset/kras_all_grn_input.jsonl", topk=50)
     """
 
@@ -311,11 +386,9 @@ class GRNInferencer:
         # ---- checkpoint-driven settings ----
         args = _get_ckpt_args(self.ckpt)
 
-        # batch_size: prefer user override; else ckpt args; else default
         ckpt_bs = args.get("batch_size", None)
         self.batch_size = int(batch_size) if batch_size is not None else int(ckpt_bs) if ckpt_bs is not None else 4096
 
-        # score_mode: prefer user override; else ckpt args; else default
         ckpt_score_mode = args.get("score_mode", None)
         self.score_mode = str(score_mode) if score_mode is not None else str(ckpt_score_mode) if ckpt_score_mode else "expected_rel"
 
@@ -325,8 +398,12 @@ class GRNInferencer:
         if not self.base_feature_names or not self.seq_feature_names:
             raise KeyError("Checkpoint missing base_feature_names / seq_feature_names (cannot build design matrix).")
 
-        # scaler: from checkpoint (prefer direct), else rebuild, else identity
-        self.scaler = _rebuild_scaler_if_needed(self.ckpt.get("scaler", None), expected_dim=len(self.base_feature_names))
+        # scaler: must be interpreted (no silent identity)
+        self.scaler = _rebuild_scaler_if_needed(
+            self.ckpt.get("scaler", None),
+            expected_dim=len(self.base_feature_names),
+            feature_names=self.base_feature_names,
+        )
 
         # model: build exactly as checkpoint expects
         self.model = self._build_model(
@@ -347,18 +424,15 @@ class GRNInferencer:
         if not isinstance(state, dict):
             raise KeyError("Checkpoint missing 'model_state' (cannot load model).")
 
-        # Pull training-time config when available
         dropout = float(args.get("dropout", 0.3))
         use_rank_head = bool(args.get("use_rank_head", True))
-        # Keep score_mode aligned (esp. if use_rank_head=False)
         self.score_mode = str(args.get("score_mode", self.score_mode))
 
-        # Infer hidden dims from state_dict (robust even if you forgot settings)
         hidden_dims = _infer_hidden_dims_from_state_dict(state)
 
         model = GRNClassifier(
             in_dim=input_dim,
-            hidden_dims=hidden_dims if len(hidden_dims) > 0 else None,  # None -> model default [256,128]
+            hidden_dims=hidden_dims if len(hidden_dims) > 0 else None,  # None -> model default
             dropout=dropout,
             score_mode=self.score_mode,
             use_rank_head=use_rank_head,
