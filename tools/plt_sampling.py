@@ -46,7 +46,7 @@ TARGET_DIRS = {
 }
 
 # Default params (safe for IDE-click run)
-MAX_POINTS_PER_SET = 2000   # max unique bitstrings per label after aggregation
+MAX_POINTS_PER_SET = 1000   # max unique bitstrings per label after aggregation
 BINS = 220                  # heatmap bins
 SEED = 0
 
@@ -130,19 +130,32 @@ def bitstrings_to_binary_matrix(bitstrings: list[str]) -> np.ndarray:
 
 
 def compute_embedding_tsne(X: np.ndarray, seed: int) -> np.ndarray:
+    import inspect
+    from sklearn.manifold import TSNE
+
     n = X.shape[0]
     perplexity = min(50, max(5, (n - 1) // 3))
-    tsne = TSNE(
+
+    kwargs = dict(
         n_components=2,
         metric="hamming",
         init="pca",
         learning_rate="auto",
         perplexity=perplexity,
-        n_iter=2000,
         random_state=seed,
         verbose=1,
     )
+
+    sig = inspect.signature(TSNE.__init__)
+    if "n_iter" in sig.parameters:
+        kwargs["n_iter"] = 2000
+    elif "max_iter" in sig.parameters:
+        kwargs["max_iter"] = 2000
+    # else: use default iterations
+
+    tsne = TSNE(**kwargs)
     return tsne.fit_transform(X)
+
 
 
 def plot_density(
