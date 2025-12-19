@@ -1,5 +1,5 @@
 # --*-- conding:utf-8 --*--
-# @time:12/18/25 22:15
+# @time:12/18/25  (patched)
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:prediction.py
@@ -15,13 +15,14 @@
 #     grn_ranked_all.csv              (optional)
 #     per_fragment/
 #       <pdb_id>_ranked.parquet
-#       <pdb_id>_topk.jsonl           (optional, if requested)
+#     top<k>.jsonl                    (optional)
 #     meta.json
 #
 # Notes:
-# - Ranking is performed within (pdb_id, group_id). In our prepared input we set group_id=0.
+# - Ranking is performed within (pdb_id, group_id). If group_id is missing, it defaults to 0.
 # - For very large N (e.g., 1.2M), parquet is strongly recommended.
-# - This script never writes model checkpoints; it only loads the GRN checkpoint and writes predictions.
+# - GRNInferencer is now checkpoint-driven; batch_size/score_mode are taken from ckpt args by default.
+#   This script allows overriding them (optional), but you can simply omit those args.
 
 from __future__ import annotations
 
@@ -29,11 +30,10 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 import pandas as pd
 
-# If this script is placed inside the same package where grn_infer.py lives:
 from Ghost_RMSD import GRNInferencer
 
 
@@ -62,10 +62,6 @@ def _safe_write_csv(df: pd.DataFrame, path: Path) -> None:
 
 
 def _save_topk_jsonl(df_ranked: pd.DataFrame, out_path: Path, k: int) -> None:
-    """
-    Save top-k rows per (pdb_id, group_id) as JSONL.
-    This is useful if you want a light-weight file for downstream decoding/export.
-    """
     if k <= 0:
         return
     need_cols = ["pdb_id", "group_id", "bitstring", "sequence", "score", "rank_in_group"]
@@ -84,7 +80,6 @@ def _save_topk_jsonl(df_ranked: pd.DataFrame, out_path: Path, k: int) -> None:
     with out_path.open("w", encoding="utf-8") as f:
         for _, r in top.iterrows():
             obj = {c: r[c] for c in need_cols}
-            # pandas types -> python types
             obj["group_id"] = int(obj["group_id"])
             obj["rank_in_group"] = int(obj["rank_in_group"])
             obj["score"] = float(obj["score"])
@@ -93,6 +88,7 @@ def _save_topk_jsonl(df_ranked: pd.DataFrame, out_path: Path, k: int) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--input", type=str, default="prepared_dataset/kras_all_grn_input.jsonl",
                     help="GRN input jsonl file.")
     ap.add_argument("--ckpt", type=str, default="checkpoints_full/grn_best.pt",
@@ -101,10 +97,13 @@ def main():
                     help="Output directory root.")
     ap.add_argument("--device", type=str, default="auto",
                     help="Device: auto|cpu|cuda|mps")
-    ap.add_argument("--batch_size", type=int, default=4096,
-                    help="Inference batch size.")
-    ap.add_argument("--score_mode", type=str, default="expected_rel",
-                    help="expected_rel|prob_rel3|logit_rel3")
+
+    # Optional overrides (if omitted, GRNInferencer uses ckpt args / defaults)
+    ap.add_argument("--batch_size", type=int, default=-1,
+                    help="Override inference batch size. Use -1 to use ckpt/default.")
+    ap.add_argument("--score_mode", type=str, default="",
+                    help="Override score_mode. Use '' to use ckpt/default.")
+
     ap.add_argument("--topk", type=int, default=0,
                     help="If >0, also save top-k per fragment as JSONL.")
     ap.add_argument("--per_fragment", action="store_true",
@@ -120,13 +119,29 @@ def main():
     out_root = Path(args.out_root) / f"run_{_now_tag()}"
     _ensure_dir(out_root)
 
-    # Save metadata for reproducibility
+    # Build inferencer kwargs (checkpoint-driven by default)
+    infer_kwargs = {
+        "ckpt": args.ckpt,
+        "device": args.device,
+    }
+    # Only override if user provided meaningful values
+    if int(args.batch_size) and int(args.batch_size) > 0:
+        infer_kwargs["batch_size"] = int(args.batch_size)
+    if isinstance(args.score_mode, str) and args.score_mode.strip():
+        infer_kwargs["score_mode"] = str(args.score_mode).strip()
+
+    # Run inference
+    inf = GRNInferencer(**infer_kwargs)
+    df_ranked = inf.predict_jsonl(inp, topk=None)  # full ranking
+    print(f"[INFO] Ranked rows: {len(df_ranked)}")
+
+    # Save metadata for reproducibility (record effective settings)
     meta = {
         "input": str(inp),
         "ckpt": str(args.ckpt),
         "device": args.device,
-        "batch_size": int(args.batch_size),
-        "score_mode": str(args.score_mode),
+        "batch_size_effective": int(getattr(inf, "batch_size", -1)),
+        "score_mode_effective": str(getattr(inf, "score_mode", "")),
         "topk": int(args.topk),
         "per_fragment": bool(args.per_fragment),
         "write_csv": bool(args.write_csv),
@@ -134,17 +149,6 @@ def main():
     }
     with (out_root / "meta.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    # Run inference
-    inf = GRNInferencer(
-        ckpt=args.ckpt,
-        device=args.device,
-        batch_size=int(args.batch_size),
-        score_mode=str(args.score_mode),
-    )
-
-    df_ranked = inf.predict_jsonl(inp, topk=None)  # full ranking
-    print(f"[INFO] Ranked rows: {len(df_ranked)}")
 
     # Write combined result
     all_parquet = out_root / "grn_ranked_all.parquet"
@@ -165,7 +169,7 @@ def main():
             _safe_write_parquet(sub.reset_index(drop=True), out_p)
         print(f"[OK] Wrote per-fragment parquet to: {per_dir}")
 
-    # Optional: top-k JSONL for fast downstream steps
+    # Optional: top-k JSONL for downstream steps
     if args.topk and args.topk > 0:
         topk_path = out_root / f"top{int(args.topk)}.jsonl"
         _save_topk_jsonl(df_ranked, topk_path, int(args.topk))
