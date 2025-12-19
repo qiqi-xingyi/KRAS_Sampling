@@ -4,8 +4,15 @@
 # @Email : yzhan135@kent.edu
 # @File:plt_sampling.py
 
-
-# It assumes your folder layout is:
+# tools/plt_sampling.py
+# ------------------------------------------------------------
+# KRAS sampling distribution visualization (Plan A)
+# - Pooled structure-space embedding using bitstring Hamming distance (t-SNE)
+# - Per-metadata density maps (WT / G12C / G12D) with light Gaussian smoothing
+# - Difference maps (G12C - WT, G12D - WT)
+# - Jensen–Shannon divergence (JSD) quantification + metrics.json
+#
+# Directory layout assumed (fixed):
 # <project_root>/
 #   KRAS_sampling_results/
 #     KRAS_4LPK_WT_1/
@@ -14,20 +21,28 @@
 #       samples_*_group0_ibm.csv ... samples_*_group9_ibm.csv
 #     KRAS_9C41_G12D_1/
 #       samples_*_group0_ibm.csv ... samples_*_group9_ibm.csv
-#   tool/
-#     plot_kras_sampling_density_A.py   <-- this file
+#   tools/
+#     plt_sampling.py   <-- this file
 #
+# Run: click Run in IDE.
 # Outputs:
 # <project_root>/KRAS_sampling_results/plots_A/
-#   density_WT.png/pdf, density_G12C.png/pdf, density_G12D.png/pdf
-#   diff_G12C_minus_WT.png/pdf, diff_G12D_minus_WT.png/pdf
+#   density_WT.png/pdf
+#   density_G12C.png/pdf
+#   density_G12D.png/pdf
+#   diff_G12C_minus_WT.png/pdf
+#   diff_G12D_minus_WT.png/pdf
 #   scatter_all.png/pdf
 #   embedding_points.csv
+#   metrics.json
+# ------------------------------------------------------------
 
 from __future__ import annotations
 
+import json
+import inspect
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -37,7 +52,7 @@ from sklearn.manifold import TSNE
 
 
 # -----------------------------
-# Fixed config (your metadata)
+# Fixed metadata (folders)
 # -----------------------------
 TARGET_DIRS = {
     "WT": "KRAS_4LPK_WT_1",
@@ -45,25 +60,43 @@ TARGET_DIRS = {
     "G12D": "KRAS_9C41_G12D_1",
 }
 
-# Default params (safe for IDE-click run)
-MAX_POINTS_PER_SET = 1000   # max unique bitstrings per label after aggregation
-BINS = 220                  # heatmap bins
-SEED = 0
+# -----------------------------
+# Default parameters (IDE-friendly)
+# -----------------------------
+MAX_POINTS_PER_SET = 2000     # max unique bitstrings per label after aggregation
+BINS = 220                    # 2D histogram bins for density maps
+SEED = 0                      # embedding seed
+SMOOTH_SIGMA = 1.2            # light smoothing for density maps (in bin units)
+
+# Optional robustness check (OFF by default to keep one-click run fast)
+ENABLE_STABILITY = False
+STABILITY_SEEDS = [0, 1, 2]
 
 
-def project_root_from_tool_dir() -> Path:
-    # tool/this_file.py -> project_root/tool -> project_root
+# -----------------------------
+# Path helpers
+# -----------------------------
+def project_root_from_tools_dir() -> Path:
+    # tools/plt_sampling.py -> tools -> project_root
     return Path(__file__).resolve().parent.parent
 
 
-def find_group_csvs(folder: Path) -> list[Path]:
-    files: list[Path] = []
+# -----------------------------
+# IO
+# -----------------------------
+def find_group_csvs(folder: Path) -> List[Path]:
+    """Only group0..9, ignore all_*.csv and other files."""
+    files: List[Path] = []
     for g in range(10):
         files.extend(sorted(folder.glob(f"samples_*_group{g}_ibm.csv")))
     return files
 
 
-def read_sampling_csvs(files: list[Path]) -> pd.DataFrame:
+def read_sampling_csvs(files: List[Path]) -> pd.DataFrame:
+    """
+    Read csvs and return minimal DF: [bitstring, weight].
+    Weight uses prob if present else count.
+    """
     dfs = []
     for f in files:
         df = pd.read_csv(f)
@@ -87,6 +120,7 @@ def read_sampling_csvs(files: list[Path]) -> pd.DataFrame:
 
 
 def aggregate_bitstrings(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate identical bitstrings and normalize weights to sum=1."""
     agg = df.groupby("bitstring", as_index=False)["weight"].sum()
     s = float(agg["weight"].sum())
     if s > 0:
@@ -95,6 +129,10 @@ def aggregate_bitstrings(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def weighted_subsample(agg: pd.DataFrame, max_points: int, seed: int) -> pd.DataFrame:
+    """
+    Subsample unique bitstrings to keep embedding tractable.
+    Keeps top 70% by weight, samples remaining 30% by weight.
+    """
     if len(agg) <= max_points:
         return agg
 
@@ -109,7 +147,7 @@ def weighted_subsample(agg: pd.DataFrame, max_points: int, seed: int) -> pd.Data
         return top
 
     rest_w = rest["weight"].to_numpy()
-    rest_w = rest_w / rest_w.sum()
+    rest_w = rest_w / (rest_w.sum() + 1e-12)
 
     k = max_points - keep_top
     idx = rng.choice(len(rest), size=k, replace=False, p=rest_w)
@@ -117,11 +155,15 @@ def weighted_subsample(agg: pd.DataFrame, max_points: int, seed: int) -> pd.Data
 
     out = pd.concat([top, samp], ignore_index=True)
     out = out.sort_values("weight", ascending=False).reset_index(drop=True)
-    out["weight"] = out["weight"] / out["weight"].sum()
+    out["weight"] = out["weight"] / (out["weight"].sum() + 1e-12)
     return out
 
 
-def bitstrings_to_binary_matrix(bitstrings: list[str]) -> np.ndarray:
+# -----------------------------
+# Embedding
+# -----------------------------
+def bitstrings_to_binary_matrix(bitstrings: List[str]) -> np.ndarray:
+    """Convert list of '0101..' -> (N, L) uint8."""
     L = len(bitstrings[0])
     X = np.empty((len(bitstrings), L), dtype=np.uint8)
     for i, s in enumerate(bitstrings):
@@ -130,9 +172,10 @@ def bitstrings_to_binary_matrix(bitstrings: list[str]) -> np.ndarray:
 
 
 def compute_embedding_tsne(X: np.ndarray, seed: int) -> np.ndarray:
-    import inspect
-    from sklearn.manifold import TSNE
-
+    """
+    t-SNE embedding with Hamming metric. Compatible with sklearn variants:
+    some use n_iter, others use max_iter.
+    """
     n = X.shape[0]
     perplexity = min(50, max(5, (n - 1) // 3))
 
@@ -151,13 +194,85 @@ def compute_embedding_tsne(X: np.ndarray, seed: int) -> np.ndarray:
         kwargs["n_iter"] = 2000
     elif "max_iter" in sig.parameters:
         kwargs["max_iter"] = 2000
-    # else: use default iterations
 
     tsne = TSNE(**kwargs)
     return tsne.fit_transform(X)
 
 
+# -----------------------------
+# Density utilities (smoothing + JSD)
+# -----------------------------
+def gaussian_smooth_2d(H: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Light 2D Gaussian smoothing for histogram maps.
+    Tries scipy first; falls back to numpy separable convolution.
+    """
+    if sigma is None or sigma <= 0:
+        return H
 
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore
+        return gaussian_filter(H, sigma=float(sigma), mode="nearest")
+    except Exception:
+        s = float(sigma)
+        radius = max(1, int(3 * s))
+        x = np.arange(-radius, radius + 1, dtype=float)
+        k = np.exp(-0.5 * (x / s) ** 2)
+        k = k / (k.sum() + 1e-12)
+
+        H0 = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 0, H)
+        H1 = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, H0)
+        return H1
+
+
+def hist2d_weighted(
+    Z: np.ndarray,
+    weights: np.ndarray,
+    bins: int,
+    xlim: Tuple[float, float],
+    ylim: Tuple[float, float],
+    smooth_sigma: float = 0.0,
+    normalize: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Weighted 2D histogram, optional smoothing, optional normalization (sum=1)."""
+    H, xedges, yedges = np.histogram2d(
+        Z[:, 0], Z[:, 1],
+        bins=bins,
+        range=[list(xlim), list(ylim)],
+        weights=weights,
+    )
+    if smooth_sigma and smooth_sigma > 0:
+        H = gaussian_smooth_2d(H, sigma=smooth_sigma)
+
+    if normalize:
+        s = float(H.sum())
+        if s > 0:
+            H = H / s
+
+    return H, xedges, yedges
+
+
+def jsd_from_grids(P: np.ndarray, Q: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Jensen–Shannon divergence between two nonnegative grids.
+    Returns JSD in bits.
+    """
+    p = P.astype(float).ravel() + eps
+    q = Q.astype(float).ravel() + eps
+    p = p / p.sum()
+    q = q / q.sum()
+    m = 0.5 * (p + q)
+
+    def kl(a, b):
+        return float(np.sum(a * (np.log(a) - np.log(b))))
+
+    jsd_nats = 0.5 * (kl(p, m) + kl(q, m))
+    return jsd_nats / np.log(2.0)
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
 def plot_density(
     Z: np.ndarray,
     weights: np.ndarray,
@@ -167,12 +282,11 @@ def plot_density(
     bins: int,
     xlim: Tuple[float, float],
     ylim: Tuple[float, float],
+    smooth_sigma: float = 1.2,
 ):
-    H, xedges, yedges = np.histogram2d(
-        Z[:, 0], Z[:, 1],
-        bins=bins,
-        range=[list(xlim), list(ylim)],
-        weights=weights,
+    H, xedges, yedges = hist2d_weighted(
+        Z, weights, bins=bins, xlim=xlim, ylim=ylim,
+        smooth_sigma=smooth_sigma, normalize=True
     )
     D = np.log1p(H)
 
@@ -183,7 +297,7 @@ def plot_density(
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
     )
-    plt.colorbar(label="log(1 + density)")
+    plt.colorbar(label="log(1 + probability mass)")
     plt.title(title)
     plt.xlabel("Structure axis 1 (t-SNE, Hamming)")
     plt.ylabel("Structure axis 2 (t-SNE, Hamming)")
@@ -204,24 +318,16 @@ def plot_diff_density(
     bins: int,
     xlim: Tuple[float, float],
     ylim: Tuple[float, float],
+    smooth_sigma: float = 1.2,
 ):
-    Hm, xedges, yedges = np.histogram2d(
-        Z_mut[:, 0], Z_mut[:, 1],
-        bins=bins,
-        range=[list(xlim), list(ylim)],
-        weights=w_mut,
+    Hm, xedges, yedges = hist2d_weighted(
+        Z_mut, w_mut, bins=bins, xlim=xlim, ylim=ylim,
+        smooth_sigma=smooth_sigma, normalize=True
     )
-    Hw, _, _ = np.histogram2d(
-        Z_wt[:, 0], Z_wt[:, 1],
-        bins=bins,
-        range=[list(xlim), list(ylim)],
-        weights=w_wt,
+    Hw, _, _ = hist2d_weighted(
+        Z_wt, w_wt, bins=bins, xlim=xlim, ylim=ylim,
+        smooth_sigma=smooth_sigma, normalize=True
     )
-
-    if Hm.sum() > 0:
-        Hm = Hm / Hm.sum()
-    if Hw.sum() > 0:
-        Hw = Hw / Hw.sum()
 
     D = Hm - Hw
     vmax = float(np.max(np.abs(D))) if np.any(D) else 1.0
@@ -236,7 +342,7 @@ def plot_diff_density(
         vmin=-vmax,
         vmax=vmax,
     )
-    plt.colorbar(label="density(mut) - density(WT)")
+    plt.colorbar(label="prob(mut) − prob(WT)")
     plt.title(title)
     plt.xlabel("Structure axis 1 (t-SNE, Hamming)")
     plt.ylabel("Structure axis 2 (t-SNE, Hamming)")
@@ -262,19 +368,22 @@ def plot_scatter_all(Z: np.ndarray, labels: np.ndarray, out_png: Path, out_pdf: 
     plt.close()
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    proj_root = project_root_from_tool_dir()
+    proj_root = project_root_from_tools_dir()
     root = proj_root / "KRAS_sampling_results"
     if not root.exists():
         raise FileNotFoundError(
             f"Cannot find KRAS_sampling_results at expected path:\n  {root}\n"
-            f"Make sure your repo layout matches the screenshot."
+            f"Make sure your repo layout matches the fixed convention."
         )
 
     out_dir = root / "plots_A"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) load & aggregate
+    # 1) load & aggregate each set
     per_set: Dict[str, pd.DataFrame] = {}
     bitlen = None
 
@@ -304,10 +413,7 @@ def main():
         print(f"[{label}] files={len(files)} unique_bitstrings={len(agg)}")
 
     # 2) pool and embed once (shared coordinate system)
-    pooled = pd.concat(
-        [df.assign(label=lab) for lab, df in per_set.items()],
-        ignore_index=True
-    )
+    pooled = pd.concat([df.assign(label=lab) for lab, df in per_set.items()], ignore_index=True)
     X = bitstrings_to_binary_matrix(pooled["bitstring"].tolist())
     labels = pooled["label"].to_numpy()
     weights = pooled["weight"].to_numpy(dtype=float)
@@ -327,26 +433,62 @@ def main():
     Z_by = {lab: Z[labels == lab] for lab in TARGET_DIRS.keys()}
     w_by = {lab: weights[labels == lab] for lab in TARGET_DIRS.keys()}
 
-    # normalize inside each label so density maps are comparable
+    # normalize inside each label
     for lab in w_by:
         s = float(w_by[lab].sum())
         if s > 0:
             w_by[lab] = w_by[lab] / s
 
-    # 3) density plots
+    # 3) compute JSD metrics on smoothed histogram grids (same bins / same limits)
+    H_wt, _, _ = hist2d_weighted(Z_by["WT"], w_by["WT"], BINS, xlim, ylim, SMOOTH_SIGMA, True)
+    H_c, _, _ = hist2d_weighted(Z_by["G12C"], w_by["G12C"], BINS, xlim, ylim, SMOOTH_SIGMA, True)
+    H_d, _, _ = hist2d_weighted(Z_by["G12D"], w_by["G12D"], BINS, xlim, ylim, SMOOTH_SIGMA, True)
+
+    jsd_g12c_wt = jsd_from_grids(H_c, H_wt)
+    jsd_g12d_wt = jsd_from_grids(H_d, H_wt)
+
+    metrics = {
+        "embedding": {
+            "method": "t-SNE",
+            "metric": "hamming",
+            "seed": int(SEED),
+            "max_points_per_set": int(MAX_POINTS_PER_SET),
+        },
+        "density": {
+            "bins": int(BINS),
+            "smooth_sigma": float(SMOOTH_SIGMA),
+        },
+        "jsd_bits": {
+            "G12C_vs_WT": float(jsd_g12c_wt),
+            "G12D_vs_WT": float(jsd_g12d_wt),
+        },
+    }
+
+    print(f"[METRIC] JSD(G12C, WT) = {jsd_g12c_wt:.4f} bits")
+    print(f"[METRIC] JSD(G12D, WT) = {jsd_g12d_wt:.4f} bits")
+
+    # 4) density plots (smoothed)
     for lab in ["WT", "G12C", "G12D"]:
+        if lab == "WT":
+            title = "KRAS structure-space sampling density (WT)"
+        elif lab == "G12C":
+            title = f"KRAS structure-space sampling density (G12C) | JSD vs WT = {jsd_g12c_wt:.3f} bits"
+        else:
+            title = f"KRAS structure-space sampling density (G12D) | JSD vs WT = {jsd_g12d_wt:.3f} bits"
+
         plot_density(
             Z_by[lab],
             w_by[lab],
             out_png=out_dir / f"density_{lab}.png",
             out_pdf=out_dir / f"density_{lab}.pdf",
-            title=f"KRAS structure-space sampling density ({lab})",
+            title=title,
             bins=BINS,
             xlim=xlim,
             ylim=ylim,
+            smooth_sigma=SMOOTH_SIGMA,
         )
 
-    # 4) difference maps
+    # 5) difference maps (smoothed)
     plot_diff_density(
         Z_mut=Z_by["G12C"], w_mut=w_by["G12C"],
         Z_wt=Z_by["WT"], w_wt=w_by["WT"],
@@ -354,6 +496,7 @@ def main():
         out_pdf=out_dir / "diff_G12C_minus_WT.pdf",
         title="KRAS density difference: G12C − WT",
         bins=BINS, xlim=xlim, ylim=ylim,
+        smooth_sigma=SMOOTH_SIGMA,
     )
     plot_diff_density(
         Z_mut=Z_by["G12D"], w_mut=w_by["G12D"],
@@ -362,9 +505,10 @@ def main():
         out_pdf=out_dir / "diff_G12D_minus_WT.pdf",
         title="KRAS density difference: G12D − WT",
         bins=BINS, xlim=xlim, ylim=ylim,
+        smooth_sigma=SMOOTH_SIGMA,
     )
 
-    # 5) pooled scatter sanity check
+    # 6) pooled scatter sanity check
     plot_scatter_all(
         Z,
         labels,
@@ -372,13 +516,37 @@ def main():
         out_pdf=out_dir / "scatter_all.pdf",
     )
 
-    # save embedding table for later overlays (energy/RMSD/topK, etc.)
+    # 7) save embedding points table
     emb = pooled.copy()
     emb["z1"] = Z[:, 0]
     emb["z2"] = Z[:, 1]
     emb.to_csv(out_dir / "embedding_points.csv", index=False)
 
-    print(f"[DONE] Saved plots + embedding_points.csv to:\n  {out_dir}")
+    # 8) optional stability check (multiple seeds)
+    if ENABLE_STABILITY:
+        stability: Dict[str, Dict[str, float]] = {}
+        for sd in STABILITY_SEEDS:
+            print(f"[STABILITY] recomputing t-SNE with seed={sd} ...")
+            Z_sd = compute_embedding_tsne(X, seed=sd)
+            Z_by_sd = {lab: Z_sd[labels == lab] for lab in TARGET_DIRS.keys()}
+
+            H_wt_sd, _, _ = hist2d_weighted(Z_by_sd["WT"], w_by["WT"], BINS, xlim, ylim, SMOOTH_SIGMA, True)
+            H_c_sd, _, _ = hist2d_weighted(Z_by_sd["G12C"], w_by["G12C"], BINS, xlim, ylim, SMOOTH_SIGMA, True)
+            H_d_sd, _, _ = hist2d_weighted(Z_by_sd["G12D"], w_by["G12D"], BINS, xlim, ylim, SMOOTH_SIGMA, True)
+
+            stability[str(sd)] = {
+                "G12C_vs_WT": float(jsd_from_grids(H_c_sd, H_wt_sd)),
+                "G12D_vs_WT": float(jsd_from_grids(H_d_sd, H_wt_sd)),
+            }
+
+        metrics["stability_jsd_bits_by_seed"] = stability
+        print("[STABILITY] JSD across seeds:", stability)
+
+    # 9) save metrics.json
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"[DONE] Saved plots + embedding_points.csv + metrics.json to:\n  {out_dir}")
 
 
 if __name__ == "__main__":
