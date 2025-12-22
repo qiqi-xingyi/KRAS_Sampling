@@ -477,6 +477,5 @@ def main():
     print("\nPer-decoded outputs:")
     print("  - backbone_rmsd.jsonl next to each decoded.jsonl")
 
-
 if __name__ == "__main__":
     main()
