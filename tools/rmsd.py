@@ -53,7 +53,6 @@ STRICT_LENGTH_MATCH = True
 # Numerical stability
 EPS = 1e-12
 
-
 # -----------------------------
 # Path helpers
 # -----------------------------
