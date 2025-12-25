@@ -4,8 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:analyze.py
 
-# docking_verify/analyze.py
-# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
