@@ -42,6 +42,8 @@ from .pdbqt import (
     batch_prepare_receptors_from_pdb,
 )
 
+from .pipeline import run_pipeline
+
 __all__ = [
     # schema
     "Case",
@@ -70,4 +72,5 @@ __all__ = [
     "prepare_ligand_pdbqt_obabel",
     "prepare_cognate_ligand_pdbqt_from_crystal",
     "batch_prepare_receptors_from_pdb",
+    "run_pipeline",
 ]
