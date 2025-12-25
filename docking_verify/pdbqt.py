@@ -7,26 +7,28 @@
 """
 docking_verify.pdbqt
 
-Use OpenBabel (obabel) to prepare receptor/ligand PDBQT files.
+OpenBabel-based receptor/ligand PDBQT preparation utilities.
 
-Design principles
------------------
-- Keep interfaces clean for external calls.
-- Avoid hard dependency on any specific conda environment name.
-- Always write provenance via deterministic file outputs (caller decides where).
+Core features
+------------
+- Strip crystal PDB to receptor-only PDB (ATOM only, optionally keep selected HET residues).
+- Extract cognate ligand from crystal PDB by residue name (e.g., GDP, MOV).
+- Convert receptor/ligand to PDBQT using OpenBabel (obabel).
+- Batch helpers and a convenience function to prepare cognate ligand PDBQT from crystal.
 
 Notes
 -----
-- For receptors, we recommend stripping crystal ligands/waters first, then convert.
-- For ligands, we recommend generating 3D if input is 2D (SDF) and adding charges.
+- For docking receptors, it is strongly recommended to strip away waters and co-crystal ligands first.
+- For crystal ligands, gen3d is usually NOT needed (they already have 3D coordinates).
+- This module is designed to be imported and called from external scripts.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple, Union
-import subprocess
 import shutil
+import subprocess
 
 from .pdbio import AtomRecord, parse_pdb_atoms, write_pdb
 
@@ -36,14 +38,11 @@ class OpenBabelError(RuntimeError):
 
 
 def _which_obabel(obabel_exe: str = "obabel") -> str:
-    """
-    Resolve obabel executable path. Raise if not found.
-    """
     p = shutil.which(obabel_exe)
     if not p:
         raise OpenBabelError(
             f"Cannot find OpenBabel executable '{obabel_exe}' in PATH. "
-            f"Please ensure OpenBabel is installed in your conda environment."
+            f"Make sure you are in the correct conda environment."
         )
     return p
 
@@ -70,15 +69,11 @@ def strip_to_receptor_pdb(
     """
     Strip a crystal PDB to a receptor-only PDB.
 
-    Default behavior:
+    Default:
       - Keep ATOM records (protein).
-      - Drop all HETATM records (ligands, ions, waters).
-      - Optionally keep selected HET resnames (e.g., {'MG'}).
-      - Optionally remove waters by resname (default HOH/WAT/H2O).
-
-    This creates a "clean receptor" that is safer for docking preparation.
-
-    Returns: resolved output path
+      - Drop all HETATM records (ligands/ions/waters).
+      - Optionally keep selected HET residue names (e.g., {'MG'}).
+      - Optionally remove waters by resname (HOH/WAT/H2O).
     """
     in_pdb = Path(in_pdb).expanduser().resolve()
     out_pdb = Path(out_pdb).expanduser().resolve()
@@ -89,31 +84,73 @@ def strip_to_receptor_pdb(
 
     atoms, other_lines = parse_pdb_atoms(in_pdb, keep_hetatm=True)
     kept_atoms: List[AtomRecord] = []
-    kept_other: List[str] = []
-
-    # Keep only essential header lines (optional). Here we keep all other lines as-is.
-    kept_other = other_lines
 
     for a in atoms:
         if a.record == "ATOM":
             kept_atoms.append(a)
             continue
 
-        # HETATM handling
         if a.record == "HETATM":
             if remove_water and a.resname in water_resnames:
                 continue
             if keep_hetatm:
-                # keep all non-water hetatm
                 kept_atoms.append(a)
                 continue
-            # keep only specified HET resnames
             if a.resname in keep_het_resnames:
                 kept_atoms.append(a)
                 continue
 
-    write_pdb(out_pdb, atoms=kept_atoms, other_lines=kept_other)
+    write_pdb(out_pdb, atoms=kept_atoms, other_lines=other_lines)
     return out_pdb
+
+
+def extract_ligand_pdb_from_crystal(
+    crystal_pdb: Union[str, Path],
+    out_ligand_pdb: Union[str, Path],
+    ligand_resname: str,
+    chain_id: Optional[str] = None,
+    allow_atom_records: bool = True,
+    exclude_resnames: Optional[Set[str]] = None,
+) -> Path:
+    """
+    Extract a ligand from a crystal PDB by residue name (e.g., GDP, MOV).
+
+    Rules:
+    - Prefer HETATM with resname == ligand_resname
+    - If none found and allow_atom_records=True, fall back to ATOM with same resname (rare)
+    - Optionally filter by chain_id
+    - Exclude common water resnames by default
+    """
+    crystal_pdb = Path(crystal_pdb).expanduser().resolve()
+    out_ligand_pdb = Path(out_ligand_pdb).expanduser().resolve()
+    out_ligand_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+    ligand_resname = ligand_resname.strip()
+    exclude_resnames = exclude_resnames or {"HOH", "WAT", "H2O"}
+
+    atoms, _other = parse_pdb_atoms(crystal_pdb, keep_hetatm=True)
+
+    def match(a: AtomRecord) -> bool:
+        if a.resname in exclude_resnames:
+            return False
+        if a.resname != ligand_resname:
+            return False
+        if chain_id is not None and a.chain != chain_id:
+            return False
+        return True
+
+    lig_atoms: List[AtomRecord] = [a for a in atoms if a.record == "HETATM" and match(a)]
+    if not lig_atoms and allow_atom_records:
+        lig_atoms = [a for a in atoms if a.record == "ATOM" and match(a)]
+
+    if not lig_atoms:
+        raise ValueError(
+            f"Cannot find ligand resname '{ligand_resname}' in {crystal_pdb} (chain_id={chain_id})."
+        )
+
+    # Ligand-only PDB: keep minimal, no need to preserve headers
+    write_pdb(out_ligand_pdb, atoms=lig_atoms, other_lines=None)
+    return out_ligand_pdb
 
 
 def prepare_receptor_pdbqt_obabel(
@@ -128,16 +165,8 @@ def prepare_receptor_pdbqt_obabel(
     """
     Convert receptor PDB to PDBQT using OpenBabel.
 
-    Typical command:
+    Typical:
       obabel receptor.pdb -O receptor.pdbqt -h --partialcharge gasteiger
-
-    Args:
-      add_h: add hydrogens
-      partialcharge: 'gasteiger' recommended; set None to skip
-      ph: optional pH for protonation (OpenBabel supports -p <pH>)
-      extra_args: appended raw args if you need custom behavior
-
-    Returns: resolved output path
     """
     obabel = _which_obabel(obabel_exe)
 
@@ -145,23 +174,14 @@ def prepare_receptor_pdbqt_obabel(
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd: List[str] = [
-        obabel,
-        str(receptor_pdb),
-        "-O",
-        str(out_pdbqt),
-    ]
+    cmd: List[str] = [obabel, str(receptor_pdb), "-O", str(out_pdbqt)]
 
     if add_h:
         cmd.append("-h")
-
     if ph is not None:
         cmd.extend(["-p", str(float(ph))])
-
     if partialcharge:
-        # OpenBabel: --partialcharge <method>
         cmd.extend(["--partialcharge", str(partialcharge)])
-
     if extra_args:
         cmd.extend(list(extra_args))
 
@@ -191,18 +211,9 @@ def prepare_ligand_pdbqt_obabel(
     """
     Convert ligand file (SDF/MOL2/PDB/...) to PDBQT using OpenBabel.
 
-    Typical commands:
+    Typical:
       obabel ligand.sdf -O ligand.pdbqt --gen3d -h --partialcharge gasteiger
-      obabel ligand.mol2 -O ligand.pdbqt -h --partialcharge gasteiger
-
-    Args:
-      gen3d: add --gen3d for inputs that may lack 3D
-      add_h: add hydrogens
-      partialcharge: 'gasteiger' recommended; set None to skip
-      ph: optional pH (OpenBabel -p)
-      extra_args: appended raw args
-
-    Returns: resolved output path
+      obabel ligand.pdb -O ligand.pdbqt -h --partialcharge gasteiger
     """
     obabel = _which_obabel(obabel_exe)
 
@@ -210,25 +221,16 @@ def prepare_ligand_pdbqt_obabel(
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd: List[str] = [
-        obabel,
-        str(ligand_in),
-        "-O",
-        str(out_pdbqt),
-    ]
+    cmd: List[str] = [obabel, str(ligand_in), "-O", str(out_pdbqt)]
 
     if gen3d:
         cmd.append("--gen3d")
-
     if add_h:
         cmd.append("-h")
-
     if ph is not None:
         cmd.extend(["-p", str(float(ph))])
-
     if partialcharge:
         cmd.extend(["--partialcharge", str(partialcharge)])
-
     if extra_args:
         cmd.extend(list(extra_args))
 
@@ -245,6 +247,46 @@ def prepare_ligand_pdbqt_obabel(
     return out_pdbqt
 
 
+def prepare_cognate_ligand_pdbqt_from_crystal(
+    crystal_pdb: Union[str, Path],
+    ligand_resname: str,
+    out_ligand_pdb: Union[str, Path],
+    out_ligand_pdbqt: Union[str, Path],
+    chain_id: Optional[str] = None,
+    obabel_exe: str = "obabel",
+    add_h: bool = True,
+    partialcharge: Optional[str] = "gasteiger",
+    ph: Optional[float] = None,
+    extra_args: Optional[Sequence[str]] = None,
+) -> Tuple[Path, Path]:
+    """
+    One-shot helper:
+      crystal PDB -> extract ligand (PDB) -> convert to ligand PDBQT
+
+    For crystal ligands, gen3d is forced to False by default, since coordinates are already 3D.
+    Returns: (ligand_pdb_path, ligand_pdbqt_path)
+    """
+    lig_pdb = extract_ligand_pdb_from_crystal(
+        crystal_pdb=crystal_pdb,
+        out_ligand_pdb=out_ligand_pdb,
+        ligand_resname=ligand_resname,
+        chain_id=chain_id,
+    )
+
+    lig_pdbqt = prepare_ligand_pdbqt_obabel(
+        ligand_in=lig_pdb,
+        out_pdbqt=out_ligand_pdbqt,
+        obabel_exe=obabel_exe,
+        gen3d=False,
+        add_h=add_h,
+        partialcharge=partialcharge,
+        ph=ph,
+        extra_args=extra_args,
+    )
+
+    return lig_pdb, lig_pdbqt
+
+
 def batch_prepare_receptors_from_pdb(
     receptor_pdbs: Iterable[Union[str, Path]],
     out_dir: Union[str, Path],
@@ -258,7 +300,7 @@ def batch_prepare_receptors_from_pdb(
     ph: Optional[float] = None,
 ) -> List[Path]:
     """
-    Convenience batch helper:
+    Batch helper:
       - optionally strip crystal PDB -> receptor.pdb
       - convert receptor.pdb -> receptor.pdbqt
     """
@@ -269,6 +311,7 @@ def batch_prepare_receptors_from_pdb(
     for pdb in receptor_pdbs:
         pdb = Path(pdb).expanduser().resolve()
         stem = pdb.stem
+
         clean_pdb = out_dir / f"{stem}.receptor.pdb" if strip_first else pdb
         pdbqt = out_dir / f"{stem}.pdbqt"
 
@@ -291,4 +334,5 @@ def batch_prepare_receptors_from_pdb(
                 ph=ph,
             )
         )
+
     return out_paths
