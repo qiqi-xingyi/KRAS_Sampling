@@ -45,14 +45,6 @@ def run_vina_once(
     log_file: Union[str, Path],
     seed: int,
 ) -> Dict:
-    """
-    Run AutoDock Vina once and write output + log to disk.
-
-    This function ALWAYS:
-    - writes --out to out_pdbqt
-    - writes --log to log_file
-    - captures stdout/stderr into log_file as well (append)
-    """
     receptor_pdbqt = str(Path(receptor_pdbqt).expanduser().resolve())
     ligand_pdbqt = str(Path(ligand_pdbqt).expanduser().resolve())
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
@@ -79,21 +71,19 @@ def run_vina_once(
         "--cpu", str(int(params.cpu)),
         "--seed", str(int(seed)),
         "--out", str(out_pdbqt),
-        "--log", str(log_file),
     ]
 
     t0 = time.time()
-    # Capture stdout/stderr for debugging; append into log_file
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     dt = time.time() - t0
 
-    # Append captured stdout/stderr to log so你无需到处找
-    with log_file.open("a", encoding="utf-8") as f:
+    # Vina v1.2.5 logs to stdout/stderr; write both to log_file
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(" ".join(cmd) + "\n\n")
         if proc.stdout:
-            f.write("\n\n=== [captured stdout] ===\n")
             f.write(proc.stdout)
         if proc.stderr:
-            f.write("\n\n=== [captured stderr] ===\n")
+            f.write("\n=== [stderr] ===\n")
             f.write(proc.stderr)
 
     return {
@@ -105,6 +95,7 @@ def run_vina_once(
         "stdout_tail": (proc.stdout or "")[-1000:],
         "stderr_tail": (proc.stderr or "")[-2000:],
     }
+
 
 
 def run_vina_multi_seed(
