@@ -44,6 +44,8 @@ from .pdbqt import (
 
 from .pipeline import run_pipeline
 
+from .meeko_pdbqt import prepare_receptor_pdbqt_meeko, MeekoError
+
 __all__ = [
     # schema
     "Case",
@@ -73,4 +75,6 @@ __all__ = [
     "prepare_cognate_ligand_pdbqt_from_crystal",
     "batch_prepare_receptors_from_pdb",
     "run_pipeline",
+    "prepare_receptor_pdbqt_meeko",
+    "MeekoError"
 ]
