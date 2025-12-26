@@ -4,446 +4,389 @@
 # @Email : yzhan135@kent.edu
 # @File:pipeline.py
 
-"""
-docking_verify.pipeline
-
-A reusable, external-call-friendly orchestration layer that runs the full docking
-verification pipeline end-to-end.
-
-Pipeline steps (per case)
--------------------------
-1) Load cases from cases.csv
-2) Build receptor PDB:
-   - receptor_mode="crystal": use crystal PDB directly
-   - receptor_mode="hybrid" : build hybrid receptor by CA alignment
-3) Strip receptor PDB to receptor-only PDB (remove waters/ligands)
-4) Convert receptor-only PDB -> receptor PDBQT via OpenBabel
-5) Prepare ligand PDBQT:
-   - ligand_mode="from_crystal": extract cognate ligand from crystal PDB and convert to PDBQT
-   - ligand_mode="external": convert user-provided ligand file to PDBQT
-6) Build Vina box from crystal ligand centroid
-7) Run Vina for multiple seeds
-8) Analyze outputs and write reports
-
-Outputs
--------
-out_dir/
-  receptors/
-    crystal/{case_id}.pdb
-    hybrid/{case_id}.pdb
-    receptor_only/{case_id}.receptor.pdb
-  ligands/
-    from_crystal/{ref_stem}_{ligand}_{chain}.pdb
-  pdbqt/
-    receptors/{case_id}.pdbqt
-    ligands/{ligand_key}.pdbqt
-  vina_out/{case_id}/seed_*/(out.pdbqt, log.txt, meta.json)
-  status/{case_id}.json
-  reports/
-    summary.csv
-    aggregate.json
-    runs.csv           (per-seed run metrics)
-"""
-
 from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+import csv
 import json
 import time
-import traceback
+import subprocess
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .schema import Box, VinaParams, load_cases_csv
-from .prep import build_hybrid_receptor_by_ca_alignment, make_box_from_ligand_centroid
+import numpy as np
+
 from .pdbqt import (
-    OpenBabelError,
-    strip_to_receptor_pdb,
-    prepare_receptor_pdbqt_obabel,
-    prepare_ligand_pdbqt_obabel,
-    prepare_cognate_ligand_pdbqt_from_crystal,
+    parse_pdb_atoms,
+    write_pdb,
+    AtomRecord,
+    kabsch,
+    write_ca_trace_pdb,
+    graft_fragment_allatom_into_crystal,
 )
-from .vina import run_vina_multi_seed
-from .analyze import (
-    analyze_vina_outputs,
-    aggregate_case_metrics,
-    write_summary_csv,
-    write_aggregate_json,
-)
-from .meeko_pdbqt import prepare_receptor_pdbqt_meeko
+from .meeko_pdbqt import prepare_receptor_pdbqt_meeko, MeekoError
+from .rebuild_allatom import rebuild_allatom_from_ca, RebuildConfig, RebuildError
 
 
+# =========================
+# Errors
+# =========================
 class PipelineError(RuntimeError):
     pass
 
 
-def _ensure_dir(p: Path) -> Path:
+class OpenBabelError(RuntimeError):
+    pass
+
+
+class VinaError(RuntimeError):
+    pass
+
+
+# =========================
+# Data models
+# =========================
+@dataclass
+class VinaParams:
+    exhaustiveness: int = 16
+    num_modes: int = 20
+    energy_range: int = 3
+    cpu: int = 8
+    seeds: Optional[List[int]] = None  # if provided overrides global seeds
+
+
+@dataclass
+class DockCase:
+    case_id: str
+    pdb_path: str
+    chain_id: str
+    start_resi: int
+    end_resi: int
+    sequence: str
+
+    # for hybrid_allatom
+    decoded_file: Optional[str] = None
+    line_index: Optional[int] = None
+    scale_factor: Optional[float] = None
+
+    # ligand
+    ligand_resname: str = "GDP"
+
+
+# =========================
+# Helpers
+# =========================
+def _ensure_dir(p: Union[str, Path]) -> Path:
+    p = Path(p).expanduser().resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def _write_json(path: Path, obj: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+def _read_jsonl_at_index(path: Union[str, Path], line_index: int) -> Dict[str, Any]:
+    path = Path(path).expanduser().resolve()
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i == int(line_index):
+                return json.loads(line)
+    raise PipelineError(f"line_index={line_index} not found in jsonl: {path}")
 
 
-def _ligand_cache_key(ref_pdb: str, ligand_resname: str, chain_id: Optional[str]) -> str:
-    stem = Path(ref_pdb).stem
-    chain = chain_id.strip() if chain_id else "any"
-    return f"{stem}_{ligand_resname}_{chain}"
+def load_predicted_main_positions(decoded_jsonl: str, line_index: int) -> List[List[float]]:
+    obj = _read_jsonl_at_index(decoded_jsonl, line_index)
+    if "main_positions" not in obj:
+        raise PipelineError("decoded.jsonl line does not contain 'main_positions'")
+    return obj["main_positions"]
 
 
-def _file_nonempty(p: Path) -> bool:
-    return p.exists() and p.is_file() and p.stat().st_size > 0
+def extract_fragment_ca_from_crystal(
+    pdb_path: Union[str, Path],
+    chain_id: str,
+    start_resi: int,
+    end_resi: int,
+) -> List[List[float]]:
+    atoms, _ = parse_pdb_atoms(Path(pdb_path), keep_hetatm=True)
+    ca: List[List[float]] = []
+    for a in atoms:
+        if a.record != "ATOM":
+            continue
+        if a.chain_id != chain_id:
+            continue
+        if not (start_resi <= int(a.resseq) <= end_resi):
+            continue
+        if a.name.strip() == "CA":
+            ca.append([float(a.x), float(a.y), float(a.z)])
+    return ca
 
 
-def run_pipeline(
-    cases_csv: Union[str, Path],
-    out_dir: Union[str, Path],
-    vina_exe: str = "vina",
-    obabel_exe: str = "obabel",
-    receptor_mode: str = "hybrid",          # "hybrid" or "crystal"
-    ligand_mode: str = "from_crystal",      # "from_crystal" or "external"
-    external_ligand: Optional[Union[str, Path]] = None,  # used if ligand_mode="external"
-    seeds: Optional[Sequence[int]] = None,
-    box_size: Tuple[float, float, float] = (20.0, 20.0, 20.0),
-    vina_params: Optional[VinaParams] = None,
-    keep_het_resnames_in_receptor: Optional[Sequence[str]] = None,  # e.g., ("MG",)
-    remove_water: bool = True,
-    resume: bool = True,
-    margin_for_pocket_hit: float = 0.0,
-    strict: bool = False,
+def write_receptor_only_pdb(
+    in_pdb: Union[str, Path],
+    out_pdb: Union[str, Path],
+    keep_metals: bool = False,
 ) -> Path:
     """
-    Run the full pipeline and write reports under out_dir/reports.
-
-    Args:
-      cases_csv: docking_data/cases.csv
-      out_dir: root output directory
-      vina_exe: path/name of AutoDock Vina executable
-      obabel_exe: path/name of OpenBabel obabel executable
-      receptor_mode:
-        - "crystal": docking on stripped crystal receptor
-        - "hybrid" : docking on hybrid receptor built by CA alignment
-      ligand_mode:
-        - "from_crystal": extract cognate ligand from crystal PDB by resname and convert to PDBQT
-        - "external": user provides external_ligand (sdf/mol2/pdb/...) converted to PDBQT once
-      external_ligand: required if ligand_mode="external"
-      seeds: list of seeds for repeated docking; default [0,1,2,3,4]
-      box_size: Vina box sizes
-      vina_params: VinaParams object; default is reasonable
-      keep_het_resnames_in_receptor: optional list of HET residue names to keep in receptor stripping
-      remove_water: remove water molecules during receptor stripping
-      resume: if outputs exist, skip recomputation
-      margin_for_pocket_hit: analysis margin (Å) for box hit
-      strict: if True, raise on first failure; if False, skip failing cases and continue
-
-    Returns:
-      Path to reports directory.
+    Create receptor-only PDB for Meeko:
+    - keep only protein ATOM lines
+    - optionally keep metal ions (HETATM) like MG, ZN
+    - drop everything else
+    - drop other_lines to avoid CONECT issues
     """
+    in_pdb = Path(in_pdb).expanduser().resolve()
+    out_pdb = Path(out_pdb).expanduser().resolve()
+    out_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+    atoms, _ = parse_pdb_atoms(in_pdb, keep_hetatm=True)
+    kept: List[AtomRecord] = []
+    for a in atoms:
+        if a.record == "ATOM":
+            kept.append(a)
+        elif keep_metals and a.record == "HETATM" and a.resname.strip() in {"MG", "MN", "ZN", "CA", "NA", "K"}:
+            kept.append(a)
+
+    for i, a in enumerate(kept, start=1):
+        a.serial = i
+
+    write_pdb(out_pdb, atoms=kept, other_lines=None)
+    return out_pdb
+
+
+def extract_ligand_pdb_from_crystal(
+    crystal_pdb: Union[str, Path],
+    ligand_resname: str,
+    out_pdb: Union[str, Path],
+) -> Tuple[Path, List[List[float]]]:
+    """
+    Extract ligand by resname from crystal PDB (HETATM). Returns ligand PDB path and coords.
+    """
+    crystal_pdb = Path(crystal_pdb).expanduser().resolve()
+    out_pdb = Path(out_pdb).expanduser().resolve()
+    out_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+    atoms, _ = parse_pdb_atoms(crystal_pdb, keep_hetatm=True)
+    lig: List[AtomRecord] = []
+    coords: List[List[float]] = []
+
+    for a in atoms:
+        if a.record != "HETATM":
+            continue
+        if a.resname.strip() != ligand_resname.strip():
+            continue
+        lig.append(a)
+        coords.append([float(a.x), float(a.y), float(a.z)])
+
+    if not lig:
+        raise PipelineError(f"Ligand {ligand_resname} not found in crystal PDB: {crystal_pdb}")
+
+    # renumber
+    for i, a in enumerate(lig, start=1):
+        a.serial = i
+
+    write_pdb(out_pdb, atoms=lig, other_lines=None)
+    return out_pdb, coords
+
+
+def centroid(xyz: Sequence[Sequence[float]]) -> Tuple[float, float, float]:
+    arr = np.array(xyz, dtype=float)
+    c = arr.mean(axis=0)
+    return float(c[0]), float(c[1]), float(c[2])
+
+
+def run_obabel_pdb_to_pdbqt(
+    obabel_exe: str,
+    in_pdb: Union[str, Path],
+    out_pdbqt: Union[str, Path],
+    log_file: Union[str, Path],
+) -> Path:
+    in_pdb = Path(in_pdb).expanduser().resolve()
+    out_pdbqt = Path(out_pdbqt).expanduser().resolve()
+    log_file = Path(log_file).expanduser().resolve()
+    out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(obabel_exe),
+        str(in_pdb),
+        "-O",
+        str(out_pdbqt),
+        "-h",
+        "--partialcharge",
+        "gasteiger",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(" ".join(cmd) + "\n\n")
+        if proc.stdout:
+            f.write(proc.stdout)
+        if proc.stderr:
+            f.write("\n=== [stderr] ===\n")
+            f.write(proc.stderr)
+
+    if proc.returncode != 0:
+        raise OpenBabelError(f"OpenBabel failed (rc={proc.returncode}). See log: {log_file}")
+
+    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+        raise OpenBabelError(f"OpenBabel produced no pdbqt: {out_pdbqt}. See log: {log_file}")
+
+    return out_pdbqt
+
+
+def parse_vina_affinities(stdout: str) -> List[float]:
+    """
+    Parse affinities from Vina stdout table.
+    Lines look like:
+      1       -7.5      0.000      0.000
+    """
+    aff: List[float] = []
+    for line in (stdout or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        parts = s.split()
+        if len(parts) >= 2 and parts[0].isdigit():
+            try:
+                aff.append(float(parts[1]))
+            except Exception:
+                pass
+    return aff
+
+
+def run_vina_once(
+    vina_exe: str,
+    receptor_pdbqt: Union[str, Path],
+    ligand_pdbqt: Union[str, Path],
+    center: Tuple[float, float, float],
+    box_size: Tuple[float, float, float],
+    params: VinaParams,
+    seed: int,
+    out_pdbqt: Union[str, Path],
+    log_file: Union[str, Path],
+) -> Dict[str, Any]:
+    receptor_pdbqt = str(Path(receptor_pdbqt).expanduser().resolve())
+    ligand_pdbqt = str(Path(ligand_pdbqt).expanduser().resolve())
+    out_pdbqt = Path(out_pdbqt).expanduser().resolve()
+    log_file = Path(log_file).expanduser().resolve()
+    out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cx, cy, cz = center
+    sx, sy, sz = box_size
+
+    cmd = [
+        str(vina_exe),
+        "--receptor", receptor_pdbqt,
+        "--ligand", ligand_pdbqt,
+        "--center_x", f"{cx:.6f}",
+        "--center_y", f"{cy:.6f}",
+        "--center_z", f"{cz:.6f}",
+        "--size_x", f"{sx:.6f}",
+        "--size_y", f"{sy:.6f}",
+        "--size_z", f"{sz:.6f}",
+        "--exhaustiveness", str(int(params.exhaustiveness)),
+        "--num_modes", str(int(params.num_modes)),
+        "--energy_range", str(int(params.energy_range)),
+        "--cpu", str(int(params.cpu)),
+        "--seed", str(int(seed)),
+        "--out", str(out_pdbqt),
+    ]
+
+    t0 = time.time()
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    dt = time.time() - t0
+
+    so, se = proc.stdout or "", proc.stderr or ""
+    aff = parse_vina_affinities(so)
+
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(" ".join(cmd) + "\n\n")
+        if so:
+            f.write(so)
+        if se:
+            f.write("\n=== [stderr] ===\n")
+            f.write(se)
+
+    if proc.returncode != 0:
+        raise VinaError(f"Vina failed (rc={proc.returncode}). See log: {log_file}")
+
+    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+        raise VinaError(f"Vina produced no output: {out_pdbqt}. See log: {log_file}")
+
+    return {
+        "cmd": cmd,
+        "returncode": int(proc.returncode),
+        "runtime_sec": float(dt),
+        "out_pdbqt": str(out_pdbqt),
+        "log_file": str(log_file),
+        "affinities": aff,
+        "best_affinity": min(aff) if aff else None,
+        "stdout_tail": so[-1200:],
+        "stderr_tail": se[-1200:],
+    }
+
+
+def read_cases_csv(cases_csv: Union[str, Path]) -> List[DockCase]:
     cases_csv = Path(cases_csv).expanduser().resolve()
-    out_dir = Path(out_dir).expanduser().resolve()
-    _ensure_dir(out_dir)
+    with cases_csv.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
 
-    if receptor_mode not in ("hybrid", "crystal"):
-        raise ValueError("receptor_mode must be 'hybrid' or 'crystal'")
-    if ligand_mode not in ("from_crystal", "external"):
-        raise ValueError("ligand_mode must be 'from_crystal' or 'external'")
-    if ligand_mode == "external" and external_ligand is None:
-        raise ValueError("external_ligand is required when ligand_mode='external'")
+    cases: List[DockCase] = []
+    for r in rows:
+        # required
+        case_id = r["case_id"]
+        pdb_path = r["pdb_path"]
+        chain_id = r.get("chain_id", "A")
+        start_resi = int(r["start_resi"])
+        end_resi = int(r["end_resi"])
+        sequence = r["sequence"]
 
-    seeds = list(seeds) if seeds is not None else [0, 1, 2, 3, 4]
-    vina_params = vina_params or VinaParams(exhaustiveness=16, num_modes=20, energy_range=3, cpu=8)
+        # optional for hybrid_allatom
+        decoded_file = r.get("decoded_file") or None
+        line_index = int(r["line_index"]) if r.get("line_index") not in (None, "", "None") else None
+        scale_factor = float(r["scale_factor"]) if r.get("scale_factor") not in (None, "", "None") else None
 
-    keep_het_set = set(keep_het_resnames_in_receptor or [])
+        ligand_resname = (r.get("ligand_resname") or "GDP").strip()
 
-    # Output structure
-    receptors_crystal_dir = _ensure_dir(out_dir / "receptors" / "crystal")
-    receptors_hybrid_dir = _ensure_dir(out_dir / "receptors" / "hybrid")
-    receptors_only_dir = _ensure_dir(out_dir / "receptors" / "receptor_only")
-    ligands_from_crystal_dir = _ensure_dir(out_dir / "ligands" / "from_crystal")
-    pdbqt_receptors_dir = _ensure_dir(out_dir / "pdbqt" / "receptors")
-    pdbqt_ligands_dir = _ensure_dir(out_dir / "pdbqt" / "ligands")
-    vina_out_dir = _ensure_dir(out_dir / "vina_out")
-    status_dir = _ensure_dir(out_dir / "status")
-    reports_dir = _ensure_dir(out_dir / "reports")
-
-    cases = load_cases_csv(cases_csv)
-
-    # Prepare external ligand pdbqt once if needed
-    external_ligand_pdbqt: Optional[Path] = None
-    if ligand_mode == "external":
-        ext = Path(external_ligand).expanduser().resolve()  # type: ignore[arg-type]
-        ligand_key = f"external_{ext.stem}"
-        external_ligand_pdbqt = pdbqt_ligands_dir / f"{ligand_key}.pdbqt"
-        if resume and _file_nonempty(external_ligand_pdbqt):
-            pass
-        else:
-            prepare_ligand_pdbqt_obabel(
-                ligand_in=ext,
-                out_pdbqt=external_ligand_pdbqt,
-                obabel_exe=obabel_exe,
-                gen3d=True,
-                add_h=True,
-                partialcharge="gasteiger",
+        cases.append(
+            DockCase(
+                case_id=case_id,
+                pdb_path=pdb_path,
+                chain_id=chain_id,
+                start_resi=start_resi,
+                end_resi=end_resi,
+                sequence=sequence,
+                decoded_file=decoded_file,
+                line_index=line_index,
+                scale_factor=scale_factor,
+                ligand_resname=ligand_resname,
             )
-
-    # Cache for crystal-derived ligands: key -> pdbqt path
-    ligand_cache: Dict[str, Path] = {}
-
-    all_run_metrics = []  # collected for reporting
-
-    for c in cases:
-        case_t0 = time.time()
-        status_path = status_dir / f"{c.case_id}.json"
-        case_status: Dict = {
-            "case_id": c.case_id,
-            "ref_pdb": c.ref_pdb,
-            "pdb_path": str(c.pdb_path),
-            "chain_id": c.chain_id,
-            "start_resi": c.start_resi,
-            "end_resi": c.end_resi,
-            "ligand_resname": c.ligand_resname,
-            "receptor_mode": receptor_mode,
-            "ligand_mode": ligand_mode,
-            "seeds": list(seeds),
-            "vina_params": asdict(vina_params),
-            "steps": {},
-            "ok": False,
-            "error": None,
-        }
-
-        try:
-            # ---- Step 1: Determine receptor PDB (crystal or hybrid)
-            if receptor_mode == "crystal":
-                receptor_pdb = receptors_crystal_dir / f"{c.case_id}.pdb"
-                if (not resume) or (not _file_nonempty(receptor_pdb)):
-                    receptor_pdb.write_text(Path(c.pdb_path).read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
-                case_status["steps"]["receptor_pdb"] = {"path": str(receptor_pdb), "mode": "crystal"}
-
-            else:
-                # hybrid
-                if c.pred_ca_pdb is None or (not c.pred_ca_pdb.exists()):
-                    raise PipelineError("Missing pred_ca_pdb for hybrid receptor build.")
-                receptor_pdb = receptors_hybrid_dir / f"{c.case_id}.pdb"
-                if (not resume) or (not _file_nonempty(receptor_pdb)):
-                    build_hybrid_receptor_by_ca_alignment(
-                        crystal_pdb=c.pdb_path,
-                        chain_id=c.chain_id,
-                        start_resi=c.start_resi,
-                        end_resi=c.end_resi,
-                        pred_ca_pdb=c.pred_ca_pdb,
-                        out_pdb=receptor_pdb,
-                    )
-                case_status["steps"]["receptor_pdb"] = {"path": str(receptor_pdb), "mode": "hybrid"}
-
-            # ---- Step 2: Strip receptor-only PDB
-            receptor_only_pdb = receptors_only_dir / f"{c.case_id}.receptor.pdb"
-            if (not resume) or (not _file_nonempty(receptor_only_pdb)):
-                strip_to_receptor_pdb(
-                    in_pdb=receptor_pdb,
-                    out_pdb=receptor_only_pdb,
-                    keep_hetatm=False,
-                    keep_het_resnames=set(keep_het_set),
-                    remove_water=remove_water,
-                )
-            case_status["steps"]["receptor_only_pdb"] = {"path": str(receptor_only_pdb)}
-
-            # ---- Step 3: Receptor PDBQT
-            receptor_pdbqt = pdbqt_receptors_dir / f"{c.case_id}.pdbqt"
-            if (not resume) or (not _file_nonempty(receptor_pdbqt)):
-                # Use Meeko for receptor PDBQT (rigid receptor)
-                receptor_pdbqt_dir = out_dir / "pdbqt" / "receptors"
-                receptor_pdbqt_dir.mkdir(parents=True, exist_ok=True)
-
-                # basename WITHOUT suffix; Meeko will append _rigid.pdbqt
-                meeko_base = receptor_pdbqt_dir / c.case_id
-
-                res = prepare_receptor_pdbqt_meeko(
-                    receptor_pdb=receptor_only_pdb,
-                    out_basename=meeko_base,
-                    mk_prepare_receptor_exe="mk_prepare_receptor.py",
-                    default_altloc="A",
-                    write_json=False,
-                    write_gpf=False,
-                )
-
-                receptor_pdbqt = res.rigid_pdbqt
-                case_status["steps"]["receptor_pdbqt"] = {"path": str(receptor_pdbqt), "backend": "meeko"}
-
-            case_status["steps"]["receptor_pdbqt"] = {"path": str(receptor_pdbqt)}
-
-            # ---- Step 4: Ligand PDBQT
-            if ligand_mode == "external":
-                assert external_ligand_pdbqt is not None
-                ligand_pdbqt = external_ligand_pdbqt
-                case_status["steps"]["ligand_pdbqt"] = {
-                    "path": str(ligand_pdbqt),
-                    "mode": "external",
-                    "key": "external",
-                }
-
-            else:
-                # from_crystal
-                lig_resname = (c.ligand_resname or "").strip()
-                if not lig_resname:
-                    # Optional fallback (if you added detect_primary_ligand_resname)
-                    # from .pdbqt import detect_primary_ligand_resname
-                    # lig_resname = detect_primary_ligand_resname(c.pdb_path)
-                    raise PipelineError("ligand_resname is empty for ligand_mode='from_crystal'.")
-
-                key = _ligand_cache_key(c.ref_pdb, lig_resname, None)
-
-                # Reuse cached ligand pdbqt if present
-                cached = ligand_cache.get(key)
-                if cached is not None and _file_nonempty(cached):
-                    ligand_pdbqt = cached
-                else:
-                    lig_pdb = ligands_from_crystal_dir / f"{key}.pdb"
-                    lig_pdbqt = pdbqt_ligands_dir / f"{key}.pdbqt"
-
-                    if (not resume) or (not _file_nonempty(lig_pdbqt)):
-                        prepare_cognate_ligand_pdbqt_from_crystal(
-                            crystal_pdb=c.pdb_path,
-                            ligand_resname=lig_resname,
-                            out_ligand_pdb=lig_pdb,
-                            out_ligand_pdbqt=lig_pdbqt,
-                            chain_id=None,
-                            obabel_exe=obabel_exe,
-                            add_h=True,
-                            partialcharge="gasteiger",
-                        )
-
-                    ligand_cache[key] = lig_pdbqt
-                    ligand_pdbqt = lig_pdbqt
-
-                case_status["steps"]["ligand_pdbqt"] = {
-                    "path": str(ligand_pdbqt),
-                    "mode": "from_crystal",
-                    "key": key,
-                    "ligand_resname": lig_resname,
-                }
-
-            # ---- Step 5: Box from crystal ligand centroid (always use crystal reference)
-            box = make_box_from_ligand_centroid(
-                complex_pdb=c.pdb_path,
-                ligand_resname=c.ligand_resname,
-                size=box_size,
-            )
-            case_status["steps"]["box"] = {
-                "center": [box.center_x, box.center_y, box.center_z],
-                "size": [box.size_x, box.size_y, box.size_z],
-            }
-
-            # ---- Step 6: Run Vina multi-seed
-            case_vina_out = vina_out_dir / c.case_id
-            if (not resume) or (not (case_vina_out.exists() and any((case_vina_out / f"seed_{s}").exists() for s in seeds))):
-                # Ensure directory exists; run will create seed_* dirs
-                _ensure_dir(case_vina_out)
-                run_vina_multi_seed(
-                    vina_exe=vina_exe,
-                    receptor_pdbqt=receptor_pdbqt,
-                    ligand_pdbqt=ligand_pdbqt,
-                    box=box,
-                    params=vina_params,
-                    out_root=case_vina_out,
-                    seeds=list(seeds),
-                )
-            case_status["steps"]["vina_out"] = {"path": str(case_vina_out)}
-
-            # HARD CHECK: require real files
-            missing = []
-            for s in seeds:
-                d = case_vina_out / f"seed_{int(s)}"
-                outp = d / "out.pdbqt"
-                logp = d / "log.txt"
-                if (not outp.exists()) or outp.stat().st_size == 0:
-                    missing.append(str(outp))
-                if (not logp.exists()) or logp.stat().st_size == 0:
-                    missing.append(str(logp))
-            if missing:
-                raise PipelineError("Vina produced no outputs: " + "; ".join(missing))
-
-            case_status["steps"]["vina_out"] = {"path": str(case_vina_out)}
-
-            # ---- Step 7: Analyze
-            run_metrics = analyze_vina_outputs(
-                out_root=case_vina_out,
-                case_id=c.case_id,
-                receptor_type=receptor_mode,
-                box=box,
-                margin=margin_for_pocket_hit,
-            )
-            # attach to global list
-            all_run_metrics.extend(run_metrics)
-
-            case_status["steps"]["analysis"] = {"n_runs": len(run_metrics)}
-            case_status["ok"] = True
-
-        except Exception as e:
-            case_status["ok"] = False
-            case_status["error"] = {
-                "type": type(e).__name__,
-                "message": str(e),
-                "traceback": traceback.format_exc(limit=10),
-            }
-            if strict:
-                _write_json(status_path, case_status)
-                raise
-        finally:
-            case_status["runtime_sec"] = time.time() - case_t0
-            _write_json(status_path, case_status)
-
-    # ---- Final reports
-    runs_csv = reports_dir / "runs.csv"
-    summary_csv = reports_dir / "summary.csv"
-    agg_json = reports_dir / "aggregate.json"
-
-    # runs.csv: per-seed records
-    # We rely on analyze.write_summary_csv style, but that file writes only run-level summary.
-    # Here we call write_summary_csv for run-level; name it runs.csv for clarity.
-    write_summary_csv(all_run_metrics, runs_csv)
-
-    # aggregate.json: per-case aggregates
-    aggs = aggregate_case_metrics(all_run_metrics)
-    write_aggregate_json(aggs, agg_json)
-
-    # summary.csv: human-friendly table derived from aggregates (simple CSV)
-    _write_summary_table_from_aggs(aggs, summary_csv)
-
-    return reports_dir.resolve()
-
-
-def _write_summary_table_from_aggs(aggs, out_csv: Path) -> None:
-    """
-    Write a simple CSV summary from CaseAggregate list.
-    """
-    import csv
-
-    out_csv = Path(out_csv).expanduser().resolve()
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "case_id",
-                "receptor_type",
-                "n_runs",
-                "best_score_mean",
-                "best_score_std",
-                "pocket_hit_rate",
-            ],
         )
-        w.writeheader()
-        for a in sorted(aggs, key=lambda x: (x.case_id, x.receptor_type)):
-            w.writerow(
-                {
-                    "case_id": a.case_id,
-                    "receptor_type": a.receptor_type,
-                    "n_runs": a.n_runs,
-                    "best_score_mean": "" if a.best_score_mean is None else a.best_score_mean,
-                    "best_score_std": "" if a.best_score_std is None else a.best_score_std,
-                    "pocket_hit_rate": "" if a.pocket_hit_rate is None else a.pocket_hit_rate,
-                }
-            )
+    return cases
+
+
+# =========================
+# Core pipeline
+# =========================
+def run_pipeline(
+    case: DockCase,
+    out_dir: Union[str, Path],
+    receptor_mode: str,
+    ligand_mode: str,
+    vina_exe: str,
+    obabel_exe: str,
+    seeds: List[int],
+    box_size: Tuple[float, float, float],
+    vina_params: VinaParams,
+    resume: bool = True,
+    strict: bool = False,
+    pulchra_exe: str = "pulchra",
+    scwrl_exe: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run a single case. Writes:
+      out_dir/status/<case_id>.json
+      out_dir/receptors/...
+      out_dir/pdbqt/...
+      out_dir/vina_out/<case_id>/seed_x/...
+    """
+    out_dir = _ensure_dir(out_dir)
+    status_dir = _
