@@ -70,6 +70,7 @@ from .analyze import (
     write_summary_csv,
     write_aggregate_json,
 )
+from .meeko_pdbqt import prepare_receptor_pdbqt_meeko
 
 
 class PipelineError(RuntimeError):
@@ -251,13 +252,25 @@ def run_pipeline(
             # ---- Step 3: Receptor PDBQT
             receptor_pdbqt = pdbqt_receptors_dir / f"{c.case_id}.pdbqt"
             if (not resume) or (not _file_nonempty(receptor_pdbqt)):
-                prepare_receptor_pdbqt_obabel(
+                # Use Meeko for receptor PDBQT (rigid receptor)
+                receptor_pdbqt_dir = out_dir / "pdbqt" / "receptors"
+                receptor_pdbqt_dir.mkdir(parents=True, exist_ok=True)
+
+                # basename WITHOUT suffix; Meeko will append _rigid.pdbqt
+                meeko_base = receptor_pdbqt_dir / c.case_id
+
+                res = prepare_receptor_pdbqt_meeko(
                     receptor_pdb=receptor_only_pdb,
-                    out_pdbqt=receptor_pdbqt,
-                    obabel_exe=obabel_exe,
-                    add_h=True,
-                    partialcharge="gasteiger",
+                    out_basename=meeko_base,
+                    mk_prepare_receptor_exe="mk_prepare_receptor.py",
+                    default_altloc="A",
+                    write_json=False,
+                    write_gpf=False,
                 )
+
+                receptor_pdbqt = res.rigid_pdbqt
+                case_status["steps"]["receptor_pdbqt"] = {"path": str(receptor_pdbqt), "backend": "meeko"}
+
             case_status["steps"]["receptor_pdbqt"] = {"path": str(receptor_pdbqt)}
 
             # ---- Step 4: Ligand PDBQT
