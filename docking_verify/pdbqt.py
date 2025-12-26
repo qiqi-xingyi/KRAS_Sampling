@@ -110,7 +110,6 @@ def strip_to_receptor_pdb(
     write_pdb(out_pdb, atoms=kept_atoms, other_lines=None)
     return out_pdb
 
-
 def extract_ligand_pdb_from_crystal(
     crystal_pdb: Union[str, Path],
     out_ligand_pdb: Union[str, Path],
