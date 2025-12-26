@@ -4,9 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:pipeline.py
 
-# docking_verify/pipeline.py
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -115,17 +112,13 @@ def _strip_receptor_atoms(
             continue
 
         if rec == "HETATM":
-            # drop ligand
             if r == lig:
                 continue
-            # drop water
             if remove_water and r in ("HOH", "WAT", "H2O"):
                 continue
-            # keep selected ions/cofactors if requested
             if keep_het and r in keep_het:
                 out.append(a)
                 continue
-            # default: drop other HETATM
             continue
 
     return out
@@ -149,28 +142,83 @@ def _centroid(atoms: List[PDBAtom]) -> Tuple[float, float, float]:
 # PDBQT sanitize (CRITICAL)
 # -------------------------
 
-_BAD_PDBQT_PREFIX = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF")
+_BAD_TORSION_PREFIX = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF")
 
-def _sanitize_pdbqt_drop_torsion_tree(pdbqt_path: Union[str, Path]) -> None:
+def _sanitize_pdbqt_common(p: Path) -> List[str]:
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    kept: List[str] = []
+    for l in lines:
+        s = l.lstrip()
+        if s.startswith(_BAD_TORSION_PREFIX):
+            continue
+        # drop totally empty
+        if not s:
+            continue
+        kept.append(l.rstrip("\n"))
+    return kept
+
+
+def _fix_atom_name_field(line: str) -> str:
     """
-    Vina 1.2.5 (your build) rejects ROOT/BRANCH tags for receptor and may reject
-    them for ligands as well (depending on parsing mode).
-    We force-remove these torsion tree keywords from BOTH receptor and ligand PDBQT.
+    PDB/PDBQT atom name field is columns [12:16] (0-based).
+    Replace any non-alnum (e.g., C4') with a safe char (P).
+    Keep fixed-width.
+    """
+    if len(line) < 16:
+        return line
+    name = line[12:16]
+    fixed = "".join((c if c.isalnum() else "P") for c in name)
+    fixed = fixed[:4].ljust(4)
+    return line[:12] + fixed + line[16:]
 
-    This makes the ligand effectively rigid, which is acceptable for your goal
-    (validation that predicted structure still forms a meaningful pocket / docking site).
+
+def _sanitize_ligand_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
+    """
+    Make ligand PDBQT robust for your Vina 1.2.5 build:
+    - remove torsion tree tags (ROOT/BRANCH/TORSDOF...)
+    - fix atom names containing special characters (C4' etc)
+    - wrap with MODEL/ENDMDL if absent
     """
     p = Path(pdbqt_path).expanduser().resolve()
     if not p.exists() or p.stat().st_size == 0:
         return
 
-    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-    kept = []
+    lines = _sanitize_pdbqt_common(p)
+
+    # fix atom name for ATOM/HETATM lines
+    fixed_lines: List[str] = []
     for l in lines:
-        if l.lstrip().startswith(_BAD_PDBQT_PREFIX):
-            continue
-        kept.append(l)
-    p.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        t = l.lstrip()
+        if t.startswith("ATOM") or t.startswith("HETATM"):
+            fixed_lines.append(_fix_atom_name_field(l))
+        else:
+            # keep REMARK/MODEL/ENDMDL etc
+            fixed_lines.append(l)
+
+    # If no MODEL wrapper, add one (many strict builds behave better)
+    has_model = any(l.lstrip().startswith("MODEL") for l in fixed_lines)
+    if not has_model:
+        body = []
+        for l in fixed_lines:
+            t = l.lstrip()
+            if t.startswith("ATOM") or t.startswith("HETATM") or t.startswith("REMARK"):
+                body.append(l)
+        fixed_lines = ["MODEL 1"] + body + ["ENDMDL"]
+
+    p.write_text("\n".join(fixed_lines) + "\n", encoding="utf-8")
+
+
+def _sanitize_receptor_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
+    """
+    Receptor must be rigid. Remove torsion tree keywords if present.
+    (Also harmless if already clean.)
+    """
+    p = Path(pdbqt_path).expanduser().resolve()
+    if not p.exists() or p.stat().st_size == 0:
+        return
+    lines = _sanitize_pdbqt_common(p)
+    # receptor: do NOT add MODEL wrapper; just write back cleaned lines
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # -------------------------
@@ -186,12 +234,11 @@ def _obabel_to_pdbqt_receptor(
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     _ensure_dir(out_pdbqt.parent)
 
-    # -xr is important: force rigid receptor output
     cmd = [
         str(obabel_exe),
         receptor_pdb,
         "-O", str(out_pdbqt),
-        "-xr",
+        "-xr",  # rigid receptor
         "-h",
         "--partialcharge", "gasteiger",
     ]
@@ -204,8 +251,7 @@ def _obabel_to_pdbqt_receptor(
             f"RC: {rc}\nSTDOUT(tail): {_tail(so)}\nSTDERR(tail): {_tail(se)}\n"
         )
 
-    # Always sanitize (important even for resume workflows)
-    _sanitize_pdbqt_drop_torsion_tree(out_pdbqt)
+    _sanitize_receptor_pdbqt_for_vina125(out_pdbqt)
     return out_pdbqt
 
 
@@ -234,8 +280,7 @@ def _obabel_to_pdbqt_ligand(
             f"RC: {rc}\nSTDOUT(tail): {_tail(so)}\nSTDERR(tail): {_tail(se)}\n"
         )
 
-    # Always sanitize ligand too (THIS is what fixes your ROOT error)
-    _sanitize_pdbqt_drop_torsion_tree(out_pdbqt)
+    _sanitize_ligand_pdbqt_for_vina125(out_pdbqt)
     return out_pdbqt
 
 
@@ -278,7 +323,6 @@ def run_pipeline(
     sx, sy, sz = float(box_size[0]), float(box_size[1]), float(box_size[2])
 
     rows = load_cases_csv(cases_csv)
-
     summary: List[Dict[str, Union[str, float, int]]] = []
 
     for row in rows:
@@ -328,39 +372,30 @@ def run_pipeline(
         t0_case = time.time()
 
         try:
-            # Read original pdb
-            atoms_all, other_all = read_pdb_atoms(pdb_path)
+            atoms_all, _other_all = read_pdb_atoms(pdb_path)
 
-            # ---------------------
-            # Ligand: extract from crystal
-            # ---------------------
+            # --- ligand (from crystal) ---
             lig_atoms = _extract_ligand_atoms(atoms_all, ligand_resname=ligand_resname)
             if not lig_atoms:
                 raise RuntimeError(f"{case_id}: ligand {ligand_resname} not found in crystal PDB.")
 
             lig_pdb = dirs["ligands"] / f"{case_id}.{ligand_resname}.pdb"
-            # IMPORTANT: write minimal, avoid CONECT etc.
             write_pdb(lig_pdb, lig_atoms, other_lines=None, drop_conect=True)
 
             lig_pdbqt = dirs["pdbqt_lig"] / f"{case_id}.{ligand_resname}.pdbqt"
-
-            # If resume and exists: still sanitize to remove ROOT
-            if lig_pdbqt.exists() and lig_pdbqt.stat().st_size > 0:
-                _sanitize_pdbqt_drop_torsion_tree(lig_pdbqt)
+            if resume and lig_pdbqt.exists() and lig_pdbqt.stat().st_size > 0:
+                _sanitize_ligand_pdbqt_for_vina125(lig_pdbqt)
             else:
                 _obabel_to_pdbqt_ligand(obabel_exe, lig_pdb, lig_pdbqt)
 
             case_status["steps"]["ligand_pdb"] = {"path": str(lig_pdb)}
             case_status["steps"]["ligand_pdbqt"] = {"path": str(lig_pdbqt)}
 
-            # Box center from crystal ligand centroid
             cx, cy, cz = _centroid(lig_atoms)
             box = DockBox(center_x=cx, center_y=cy, center_z=cz, size_x=sx, size_y=sy, size_z=sz)
             case_status["steps"]["box"] = {"center": [cx, cy, cz], "size": [sx, sy, sz]}
 
-            # ---------------------
-            # Receptor base: crystal minus ligand/water/etc.
-            # ---------------------
+            # --- receptor base ---
             rec_atoms = _strip_receptor_atoms(
                 atoms_all,
                 ligand_resname=ligand_resname,
@@ -368,19 +403,14 @@ def run_pipeline(
                 keep_het_resnames=keep_het_resnames_in_receptor,
             )
             receptor_base_pdb = dirs["receptors"] / f"{case_id}.receptor_base.pdb"
-
-            # IMPORTANT: keep it minimal to avoid OpenBabel parse issues
             write_pdb(receptor_base_pdb, rec_atoms, other_lines=None, drop_conect=True)
 
             receptor_pdb = receptor_base_pdb
 
-            # ---------------------
-            # Hybrid (optional): template_fit replacement
-            # ---------------------
+            # --- hybrid receptor (template_fit) ---
             if receptor_mode == "hybrid_templatefit":
                 if not decoded_file:
                     raise RuntimeError(f"{case_id}: receptor_mode=hybrid_templatefit but decoded_file missing.")
-
                 hybrid_pdb = dirs["receptors"] / f"{case_id}.hybrid.pdb"
                 if (not resume) or (not hybrid_pdb.exists()) or hybrid_pdb.stat().st_size == 0:
                     build_hybrid_receptor_by_template_fit(
@@ -401,22 +431,16 @@ def run_pipeline(
 
             case_status["steps"]["receptor_pdb"] = {"path": str(receptor_pdb), "mode": receptor_mode}
 
-            # ---------------------
-            # Receptor PDBQT (rigid)
-            # ---------------------
+            # --- receptor pdbqt ---
             receptor_pdbqt = dirs["pdbqt_rec"] / f"{case_id}.pdbqt"
-
-            # If resume and exists: still sanitize to remove ROOT/BRANCH if any
-            if receptor_pdbqt.exists() and receptor_pdbqt.stat().st_size > 0:
-                _sanitize_pdbqt_drop_torsion_tree(receptor_pdbqt)
+            if resume and receptor_pdbqt.exists() and receptor_pdbqt.stat().st_size > 0:
+                _sanitize_receptor_pdbqt_for_vina125(receptor_pdbqt)
             else:
                 _obabel_to_pdbqt_receptor(obabel_exe, receptor_pdb, receptor_pdbqt)
 
             case_status["steps"]["receptor_pdbqt"] = {"path": str(receptor_pdbqt)}
 
-            # ---------------------
-            # Run Vina
-            # ---------------------
+            # --- run vina ---
             vina_out_root = dirs["vina_out"] / case_id
             runs = run_vina_multi_seed(
                 vina_exe=vina_exe,
@@ -432,12 +456,12 @@ def run_pipeline(
             case_status["steps"]["vina_out"] = {"path": str(vina_out_root)}
             case_status["steps"]["analysis"] = {"n_runs": len(runs)}
 
-            # Parse best score among all seeds
             all_scores: List[float] = []
             n_ok = 0
             for r in runs:
-                if r.returncode == 0 and Path(r.out_pdbqt).exists() and Path(r.out_pdbqt).stat().st_size > 0:
-                    scores = parse_vina_scores_from_out_pdbqt(r.out_pdbqt)
+                outp = Path(r.out_pdbqt)
+                if r.returncode == 0 and outp.exists() and outp.stat().st_size > 0:
+                    scores = parse_vina_scores_from_out_pdbqt(outp)
                     if scores:
                         all_scores.append(min(scores))
                         n_ok += 1
@@ -465,9 +489,7 @@ def run_pipeline(
             case_status["runtime_sec"] = float(time.time() - t0_case)
             status_path.write_text(json.dumps(case_status, indent=2), encoding="utf-8")
 
-    # ---------------------
-    # Reports
-    # ---------------------
+    # --- reports ---
     summary_csv = dirs["reports"] / "summary.csv"
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
         fieldnames = ["case_id", "receptor_mode", "ligand_resname", "n_runs", "n_ok", "best_score"]
