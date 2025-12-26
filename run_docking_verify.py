@@ -73,7 +73,7 @@ KEEP_HET_RESNAMES_IN_RECEPTOR = []  # e.g., ["MG", "ZN"]
 REMOVE_WATER = True
 
 # Robustness controls
-RESUME = True      # skip steps if outputs exist
+RESUME = False      # skip steps if outputs exist
 STRICT = False     # True -> stop immediately on first failure
 
 # =========================
