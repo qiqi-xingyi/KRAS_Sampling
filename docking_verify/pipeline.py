@@ -17,23 +17,12 @@ from .template_fit import (
     read_pdb_atoms, write_pdb, PDBAtom,
     build_hybrid_receptor_by_template_fit,
 )
+
+# unified API names (NO *_strict imports)
 from .pdbqt import (
-    prepare_ligand_pdbqt_obabel_strict,
-    prepare_receptor_pdbqt_obabel_strict,
+    prepare_ligand_pdbqt_obabel,
+    prepare_receptor_pdbqt_obabel,
 )
-
-
-# -------------------------
-# Data structures
-# -------------------------
-
-@dataclass
-class VinaParams:
-    exhaustiveness: int = 16
-    num_modes: int = 20
-    energy_range: int = 3
-    cpu: int = 8
-    seeds: Optional[List[int]] = None
 
 
 @dataclass
@@ -45,10 +34,6 @@ class DockBox:
     size_y: float
     size_z: float
 
-
-# -------------------------
-# Small utilities
-# -------------------------
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
@@ -75,7 +60,7 @@ def load_cases_csv(cases_csv: Union[str, Path]) -> List[Dict[str, str]]:
 
 
 # -------------------------
-# Robust getters for PDBAtom (avoid chain_id mismatch)
+# Robust getters for PDBAtom
 # -------------------------
 
 def _atom_record(a: PDBAtom) -> str:
@@ -85,11 +70,9 @@ def _atom_resname(a: PDBAtom) -> str:
     return str(getattr(a, "resname", "")).strip()
 
 def _atom_chain(a: PDBAtom) -> str:
-    # template_fit may use .chain (common) rather than .chain_id
     return str(getattr(a, "chain_id", getattr(a, "chain", "")) or "").strip()
 
 def _atom_resseq(a: PDBAtom) -> int:
-    # be generous: resseq / resi / resid / res_seq
     for k in ("resseq", "res_seq", "resi", "resid"):
         if hasattr(a, k):
             try:
@@ -142,10 +125,6 @@ def _group_by_ligand_instance(
     ligand_resname: str,
     chain_id: Optional[str] = None,
 ) -> Dict[Tuple[str, int, str], List[PDBAtom]]:
-    """
-    Group ligand atoms by (chain, resseq, icode) to avoid multi-ligand -> multi-model.
-    Works even if PDBAtom has .chain (not .chain_id).
-    """
     lig = ligand_resname.upper()
     groups: Dict[Tuple[str, int, str], List[PDBAtom]] = {}
 
@@ -172,11 +151,6 @@ def _pick_single_ligand_instance(
     ligand_resname: str,
     chain_id: Optional[str],
 ) -> Tuple[List[PDBAtom], str]:
-    """
-    Pick ONE ligand instance:
-    - Prefer requested chain_id if possible
-    - Choose the instance with max atom count
-    """
     groups = _group_by_ligand_instance(atoms, ligand_resname, chain_id=chain_id)
     if not groups and chain_id is not None:
         groups = _group_by_ligand_instance(atoms, ligand_resname, chain_id=None)
@@ -214,7 +188,7 @@ def run_pipeline(
     ligand_mode: str = "from_crystal",
     seeds: Sequence[int] = (0, 1, 2, 3, 4),
     box_size: Sequence[float] = (20.0, 20.0, 20.0),
-    vina_params: Optional[VinaParams] = None,
+    vina_params=None,  # keep it simple; your run_docking_verify passes dv.VinaParams from schema anyway
     keep_het_resnames_in_receptor: Optional[Sequence[str]] = None,
     remove_water: bool = True,
     resume: bool = True,
@@ -236,7 +210,8 @@ def run_pipeline(
         "reports": _ensure_dir(out_dir / "reports"),
     }
 
-    params = vina_params or VinaParams()
+    # VinaParams object can come from schema, keep flexible
+    params = vina_params
     sx, sy, sz = float(box_size[0]), float(box_size[1]), float(box_size[2])
 
     rows = load_cases_csv(cases_csv)
@@ -275,12 +250,6 @@ def run_pipeline(
             "receptor_mode": receptor_mode,
             "ligand_mode": ligand_mode,
             "seeds": list(map(int, seeds)),
-            "vina_params": {
-                "exhaustiveness": int(params.exhaustiveness),
-                "num_modes": int(params.num_modes),
-                "energy_range": int(params.energy_range),
-                "cpu": int(params.cpu),
-            },
             "steps": {},
             "ok": False,
             "error": None,
@@ -296,20 +265,17 @@ def run_pipeline(
                 atoms_all, ligand_resname=ligand_resname, chain_id=chain_id
             )
             if not lig_atoms:
-                raise RuntimeError(
-                    f"{case_id}: ligand {ligand_resname} not found in crystal PDB (chain {chain_id})."
-                )
+                raise RuntimeError(f"{case_id}: ligand {ligand_resname} not found in PDB (chain {chain_id}).")
 
             lig_pdb = dirs["ligands"] / f"{case_id}.{ligand_resname}.{lig_key or 'any'}.pdb"
             write_pdb(lig_pdb, lig_atoms, other_lines=None, drop_conect=True)
 
-            # --- ligand pdbqt: ALWAYS regenerate strict to avoid stale bad files ---
             lig_pdbqt = dirs["pdbqt_lig"] / f"{case_id}.{ligand_resname}.{lig_key or 'any'}.pdbqt"
-            prepare_ligand_pdbqt_obabel_strict(
+            prepare_ligand_pdbqt_obabel(
                 ligand_pdb=lig_pdb,
                 out_pdbqt=lig_pdbqt,
                 obabel_exe=obabel_exe,
-                force=True,   # critical: no stale file
+                force=True,  # critical: no stale bad files
             )
 
             case_status["steps"]["ligand_pdb"] = {"path": str(lig_pdb), "instance": lig_key}
@@ -330,8 +296,9 @@ def run_pipeline(
             receptor_base_pdb = dirs["receptors"] / f"{case_id}.receptor_base.pdb"
             write_pdb(receptor_base_pdb, rec_atoms, other_lines=None, drop_conect=True)
 
-            # --- receptor pdb (hybrid or crystal) ---
             receptor_pdb = receptor_base_pdb
+
+            # --- hybrid receptor (template_fit) ---
             if receptor_mode == "hybrid_templatefit":
                 if not decoded_file:
                     raise RuntimeError(f"{case_id}: receptor_mode=hybrid_templatefit but decoded_file missing.")
@@ -355,13 +322,12 @@ def run_pipeline(
 
             case_status["steps"]["receptor_pdb"] = {"path": str(receptor_pdb), "mode": receptor_mode}
 
-            # --- receptor pdbqt: ALWAYS regenerate strict (same reason) ---
             receptor_pdbqt = dirs["pdbqt_rec"] / f"{case_id}.pdbqt"
-            prepare_receptor_pdbqt_obabel_strict(
+            prepare_receptor_pdbqt_obabel(
                 receptor_pdb=receptor_pdb,
                 out_pdbqt=receptor_pdbqt,
                 obabel_exe=obabel_exe,
-                force=True,   # critical
+                force=True,  # critical
             )
             case_status["steps"]["receptor_pdbqt"] = {"path": str(receptor_pdbqt)}
 

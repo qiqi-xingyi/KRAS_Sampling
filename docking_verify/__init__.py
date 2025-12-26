@@ -1,9 +1,7 @@
-# --*-- conding:utf-8 --*--
-# @time:12/24/25 20:45
+# --*-- coding:utf-8 --*--
+# @time:12/24/25
 # @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
-# @File:__init__.py.py
-
+# @File:__init__.py
 
 from .schema import (
     Case,
@@ -36,12 +34,12 @@ from .pdbqt import (
     OpenBabelError,
     prepare_receptor_pdbqt_obabel,
     prepare_ligand_pdbqt_obabel,
-
 )
 
-from .pipeline import run_pipeline, VinaParams
+from .pipeline import run_pipeline
 
 from .meeko_pdbqt import prepare_receptor_pdbqt_meeko, MeekoError
+
 
 __all__ = [
     # schema
@@ -67,7 +65,9 @@ __all__ = [
     "OpenBabelError",
     "prepare_receptor_pdbqt_obabel",
     "prepare_ligand_pdbqt_obabel",
+    # pipeline
     "run_pipeline",
+    # meeko
     "prepare_receptor_pdbqt_meeko",
-    "MeekoError"
+    "MeekoError",
 ]
