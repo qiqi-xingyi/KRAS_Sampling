@@ -42,7 +42,7 @@ from .pdbqt import (
     batch_prepare_receptors_from_pdb,
 )
 
-from .pipeline import run_pipeline
+from .pipeline import run_pipeline, VinaParams
 
 from .meeko_pdbqt import prepare_receptor_pdbqt_meeko, MeekoError
 

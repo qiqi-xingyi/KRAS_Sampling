@@ -173,11 +173,12 @@ def parse_vina_scores_from_out_pdbqt(out_pdbqt: Union[str, Path]) -> List[float]
     scores: List[float] = []
     for line in out_pdbqt.read_text(encoding="utf-8", errors="ignore").splitlines():
         if line.startswith("REMARK VINA RESULT:"):
-            # format: REMARK VINA RESULT:     -7.6      0.000      0.000
             parts = line.split()
+            # Typical: ["REMARK","VINA","RESULT:","-7.6","0.000","0.000"]
             if len(parts) >= 4:
                 try:
                     scores.append(float(parts[3]))
                 except Exception:
-                    pass
+                    continue
     return scores
+
