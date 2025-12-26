@@ -142,17 +142,17 @@ def _centroid(atoms: List[PDBAtom]) -> Tuple[float, float, float]:
 # PDBQT sanitize (CRITICAL)
 # -------------------------
 
+
 _BAD_TORSION_PREFIX = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF")
 
-def _sanitize_pdbqt_common(p: Path) -> List[str]:
+def _sanitize_pdbqt_common_lines(p: Path) -> List[str]:
     lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
     kept: List[str] = []
     for l in lines:
         s = l.lstrip()
-        if s.startswith(_BAD_TORSION_PREFIX):
-            continue
-        # drop totally empty
         if not s:
+            continue
+        if s.startswith(_BAD_TORSION_PREFIX):
             continue
         kept.append(l.rstrip("\n"))
     return kept
@@ -160,9 +160,8 @@ def _sanitize_pdbqt_common(p: Path) -> List[str]:
 
 def _fix_atom_name_field(line: str) -> str:
     """
-    PDB/PDBQT atom name field is columns [12:16] (0-based).
-    Replace any non-alnum (e.g., C4') with a safe char (P).
-    Keep fixed-width.
+    PDB/PDBQT atom name field is columns 13-16 (0-based [12:16]).
+    Replace any non-alnum (e.g., C4') with 'P'.
     """
     if len(line) < 16:
         return line
@@ -172,54 +171,94 @@ def _fix_atom_name_field(line: str) -> str:
     return line[:12] + fixed + line[16:]
 
 
+def _keep_only_first_model_payload(lines: List[str]) -> List[str]:
+    """
+    If multi-MODEL exists, keep only payload of the first MODEL.
+    Remove all MODEL/ENDMDL tags.
+    If no MODEL tag, keep all lines as-is.
+    """
+    model_idx = 0
+    in_model = False
+    out: List[str] = []
+
+    has_any_model = any(l.lstrip().startswith("MODEL") for l in lines)
+    if not has_any_model:
+        return lines
+
+    for l in lines:
+        s = l.lstrip()
+        if s.startswith("MODEL"):
+            model_idx += 1
+            in_model = (model_idx == 1)
+            continue
+        if s.startswith("ENDMDL"):
+            if model_idx == 1:
+                in_model = False
+            continue
+        if model_idx == 1 and in_model:
+            out.append(l)
+        else:
+            # ignore payload from model 2+
+            continue
+
+    return out
+
+
 def _sanitize_ligand_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
     """
-    Make ligand PDBQT robust for your Vina 1.2.5 build:
+    Make ligand PDBQT compatible with strict Vina 1.2.5:
     - remove torsion tree tags (ROOT/BRANCH/TORSDOF...)
-    - fix atom names containing special characters (C4' etc)
-    - wrap with MODEL/ENDMDL if absent
+    - keep only first MODEL payload if multi-model exists
+    - remove MODEL/ENDMDL tags entirely (avoid Vina multi-model complaint)
+    - fix atom names with special chars (C4' -> C4P etc)
+    - keep only REMARK/ATOM/HETATM lines (drop others)
     """
     p = Path(pdbqt_path).expanduser().resolve()
     if not p.exists() or p.stat().st_size == 0:
         return
 
-    lines = _sanitize_pdbqt_common(p)
+    lines = _sanitize_pdbqt_common_lines(p)
+    lines = _keep_only_first_model_payload(lines)
 
-    # fix atom name for ATOM/HETATM lines
-    fixed_lines: List[str] = []
+    cleaned: List[str] = []
     for l in lines:
-        t = l.lstrip()
-        if t.startswith("ATOM") or t.startswith("HETATM"):
-            fixed_lines.append(_fix_atom_name_field(l))
+        s = l.lstrip()
+        if s.startswith("ATOM") or s.startswith("HETATM"):
+            cleaned.append(_fix_atom_name_field(l))
+        elif s.startswith("REMARK"):
+            cleaned.append(l)
         else:
-            # keep REMARK/MODEL/ENDMDL etc
-            fixed_lines.append(l)
+            # drop everything else to be strict
+            continue
 
-    # If no MODEL wrapper, add one (many strict builds behave better)
-    has_model = any(l.lstrip().startswith("MODEL") for l in fixed_lines)
-    if not has_model:
-        body = []
-        for l in fixed_lines:
-            t = l.lstrip()
-            if t.startswith("ATOM") or t.startswith("HETATM") or t.startswith("REMARK"):
-                body.append(l)
-        fixed_lines = ["MODEL 1"] + body + ["ENDMDL"]
-
-    p.write_text("\n".join(fixed_lines) + "\n", encoding="utf-8")
+    p.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
 
 
 def _sanitize_receptor_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
     """
-    Receptor must be rigid. Remove torsion tree keywords if present.
-    (Also harmless if already clean.)
+    Receptor must be rigid: remove torsion tree tags if present.
+    Also strip MODEL/ENDMDL if any weirdness appears (keep first model only).
     """
     p = Path(pdbqt_path).expanduser().resolve()
     if not p.exists() or p.stat().st_size == 0:
         return
-    lines = _sanitize_pdbqt_common(p)
-    # receptor: do NOT add MODEL wrapper; just write back cleaned lines
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    lines = _sanitize_pdbqt_common_lines(p)
+    lines = _keep_only_first_model_payload(lines)
+
+    cleaned: List[str] = []
+    for l in lines:
+        s = l.lstrip()
+        if s.startswith("ATOM") or s.startswith("HETATM") or s.startswith("REMARK"):
+            # receptor atom names normally don't have `'`, but fix harmlessly anyway
+            if s.startswith("ATOM") or s.startswith("HETATM"):
+                cleaned.append(_fix_atom_name_field(l))
+            else:
+                cleaned.append(l)
+        else:
+            continue
+
+    p.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
 
 # -------------------------
 # OpenBabel conversion
