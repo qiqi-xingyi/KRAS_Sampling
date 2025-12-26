@@ -11,24 +11,28 @@ OpenBabel-based receptor/ligand PDBQT preparation utilities.
 
 Core features
 ------------
-- Strip crystal PDB to receptor-only PDB (ATOM only, optionally keep selected HET residues).
+- Strip crystal/hybrid PDB to receptor-only PDB (ATOM only, optionally keep selected HET residues).
 - Extract cognate ligand from crystal PDB by residue name (e.g., GDP, MOV).
 - Convert receptor/ligand to PDBQT using OpenBabel (obabel).
-- Batch helpers and a convenience function to prepare cognate ligand PDBQT from crystal.
+- Sanitize OpenBabel PDBQT for AutoDock Vina v1.2.5 (remove ROOT/BRANCH/TORSDOF... tags).
+- Batch helpers.
+- Kabsch + graft helpers for hybrid construction (kept here for convenience).
 
 Notes
 -----
-- For docking receptors, it is strongly recommended to strip away waters and co-crystal ligands first.
+- We intentionally do NOT carry over other_lines from the original PDB in stripping/writing,
+  because CONECT records can become inconsistent after hybrid rebuilding, which breaks OpenBabel parsing.
 - For crystal ligands, gen3d is usually NOT needed (they already have 3D coordinates).
-- This module is designed to be imported and called from external scripts.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import shutil
 import subprocess
+
+import numpy as np
 
 from .pdbio import AtomRecord, parse_pdb_atoms, write_pdb
 
@@ -37,14 +41,27 @@ class OpenBabelError(RuntimeError):
     pass
 
 
+# =========================
+# Executable + subprocess
+# =========================
+
 def _which_obabel(obabel_exe: str = "obabel") -> str:
-    p = shutil.which(obabel_exe)
-    if not p:
+    """
+    Resolve OpenBabel executable:
+    - If obabel_exe is an existing file path, use it directly.
+    - Else search in PATH.
+    """
+    p = Path(obabel_exe)
+    if p.exists() and p.is_file():
+        return str(p.expanduser().resolve())
+
+    found = shutil.which(obabel_exe)
+    if not found:
         raise OpenBabelError(
-            f"Cannot find OpenBabel executable '{obabel_exe}' in PATH. "
-            f"Make sure you are in the correct conda environment."
+            f"Cannot find OpenBabel executable '{obabel_exe}'. "
+            f"Make sure you are in the correct conda environment, or pass an absolute path."
         )
-    return p
+    return found
 
 
 def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
@@ -57,6 +74,97 @@ def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     out, err = p.communicate()
     return p.returncode, out, err
 
+
+# =========================
+# PDBQT sanitize for Vina 1.2.5
+# =========================
+
+_BAD_TAGS_VINA125: Set[str] = {"ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF", "CONECT"}
+
+
+def sanitize_pdbqt_for_vina125(
+    in_pdbqt: Union[str, Path],
+    out_pdbqt: Union[str, Path],
+    drop_tags: Optional[Set[str]] = None,
+) -> Path:
+    """
+    Vina v1.2.5 may reject ROOT/BRANCH/TORSDOF tags. Some converters (including OpenBabel in
+    some configs) emit these tags for ligands/receptors. This is a pure text filter.
+
+    Removes any line whose first token is in drop_tags.
+    """
+    in_pdbqt = Path(in_pdbqt).expanduser().resolve()
+    out_pdbqt = Path(out_pdbqt).expanduser().resolve()
+    out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
+
+    tags = drop_tags or set(_BAD_TAGS_VINA125)
+
+    lines_in = in_pdbqt.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    kept: List[str] = []
+    for line in lines_in:
+        s = line.strip()
+        if not s:
+            continue
+        first = s.split()[0]
+        if first in tags:
+            continue
+        kept.append(line)
+
+    out_pdbqt.write_text("".join(kept), encoding="utf-8")
+    return out_pdbqt
+
+
+def _obabel_to_pdbqt_and_sanitize(
+    in_file: Union[str, Path],
+    out_pdbqt: Union[str, Path],
+    obabel_exe: str,
+    add_h: bool,
+    partialcharge: Optional[str],
+    ph: Optional[float],
+    extra_args: Optional[Sequence[str]],
+) -> Path:
+    """
+    Convert to a temporary raw PDBQT with OpenBabel, then sanitize to final PDBQT for Vina 1.2.5.
+    """
+    obabel = _which_obabel(obabel_exe)
+
+    in_file = Path(in_file).expanduser().resolve()
+    out_pdbqt = Path(out_pdbqt).expanduser().resolve()
+    out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_pdbqt = out_pdbqt.parent / f"{out_pdbqt.stem}.raw.pdbqt"
+
+    cmd: List[str] = [obabel, str(in_file), "-O", str(raw_pdbqt)]
+
+    if add_h:
+        cmd.append("-h")
+    if ph is not None:
+        cmd.extend(["-p", str(float(ph))])
+    if partialcharge:
+        cmd.extend(["--partialcharge", str(partialcharge)])
+    if extra_args:
+        cmd.extend(list(extra_args))
+
+    code, out, err = _run_cmd(cmd)
+    if code != 0 or (not raw_pdbqt.exists()) or raw_pdbqt.stat().st_size == 0:
+        raise OpenBabelError(
+            "OpenBabel conversion failed.\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"Return code: {code}\n"
+            f"STDOUT(tail): {out[-2000:]}\n"
+            f"STDERR(tail): {err[-2000:]}\n"
+        )
+
+    sanitize_pdbqt_for_vina125(raw_pdbqt, out_pdbqt)
+    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+        raise OpenBabelError(f"sanitize_pdbqt_for_vina125 produced empty pdbqt: {out_pdbqt}")
+
+    return out_pdbqt
+
+
+# =========================
+# PDB stripping + ligand extraction
+# =========================
 
 def strip_to_receptor_pdb(
     in_pdb: Union[str, Path],
@@ -99,16 +207,13 @@ def strip_to_receptor_pdb(
                 kept_atoms.append(a)
                 continue
 
-    # (Optional but recommended) re-number serials to keep PDB clean
+    # Re-number serials to keep PDB clean
     for i, a in enumerate(kept_atoms, start=1):
-        try:
-            a.serial = i
-        except Exception:
-            pass
+        a.serial = i
 
-    # Scheme A: do NOT write other_lines (avoid CONECT/END/Master issues)
     write_pdb(out_pdb, atoms=kept_atoms, other_lines=None)
     return out_pdb
+
 
 def extract_ligand_pdb_from_crystal(
     crystal_pdb: Union[str, Path],
@@ -141,7 +246,7 @@ def extract_ligand_pdb_from_crystal(
             return False
         if a.resname != ligand_resname:
             return False
-        if chain_id is not None and a.chain != chain_id:
+        if chain_id is not None and a.chain_id != chain_id:
             return False
         return True
 
@@ -154,10 +259,13 @@ def extract_ligand_pdb_from_crystal(
             f"Cannot find ligand resname '{ligand_resname}' in {crystal_pdb} (chain_id={chain_id})."
         )
 
-    # Ligand-only PDB: keep minimal, no need to preserve headers
     write_pdb(out_ligand_pdb, atoms=lig_atoms, other_lines=None)
     return out_ligand_pdb
 
+
+# =========================
+# OpenBabel -> PDBQT (sanitized)
+# =========================
 
 def prepare_receptor_pdbqt_obabel(
     receptor_pdb: Union[str, Path],
@@ -169,39 +277,21 @@ def prepare_receptor_pdbqt_obabel(
     extra_args: Optional[Sequence[str]] = None,
 ) -> Path:
     """
-    Convert receptor PDB to PDBQT using OpenBabel.
-
-    Typical:
-      obabel receptor.pdb -O receptor.pdbqt -h --partialcharge gasteiger
+    Convert receptor PDB to PDBQT using OpenBabel, then sanitize for Vina v1.2.5.
     """
-    obabel = _which_obabel(obabel_exe)
-
     receptor_pdb = Path(receptor_pdb).expanduser().resolve()
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd: List[str] = [obabel, str(receptor_pdb), "-O", str(out_pdbqt)]
-
-    if add_h:
-        cmd.append("-h")
-    if ph is not None:
-        cmd.extend(["-p", str(float(ph))])
-    if partialcharge:
-        cmd.extend(["--partialcharge", str(partialcharge)])
-    if extra_args:
-        cmd.extend(list(extra_args))
-
-    code, out, err = _run_cmd(cmd)
-    if code != 0 or (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
-        raise OpenBabelError(
-            "OpenBabel receptor conversion failed.\n"
-            f"CMD: {' '.join(cmd)}\n"
-            f"Return code: {code}\n"
-            f"STDOUT(tail): {out[-2000:]}\n"
-            f"STDERR(tail): {err[-2000:]}\n"
-        )
-
-    return out_pdbqt
+    return _obabel_to_pdbqt_and_sanitize(
+        in_file=receptor_pdb,
+        out_pdbqt=out_pdbqt,
+        obabel_exe=obabel_exe,
+        add_h=add_h,
+        partialcharge=partialcharge,
+        ph=ph,
+        extra_args=extra_args,
+    )
 
 
 def prepare_ligand_pdbqt_obabel(
@@ -215,42 +305,27 @@ def prepare_ligand_pdbqt_obabel(
     extra_args: Optional[Sequence[str]] = None,
 ) -> Path:
     """
-    Convert ligand file (SDF/MOL2/PDB/...) to PDBQT using OpenBabel.
-
-    Typical:
-      obabel ligand.sdf -O ligand.pdbqt --gen3d -h --partialcharge gasteiger
-      obabel ligand.pdb -O ligand.pdbqt -h --partialcharge gasteiger
+    Convert ligand file (SDF/MOL2/PDB/...) to PDBQT using OpenBabel, then sanitize for Vina v1.2.5.
     """
-    obabel = _which_obabel(obabel_exe)
-
     ligand_in = Path(ligand_in).expanduser().resolve()
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd: List[str] = [obabel, str(ligand_in), "-O", str(out_pdbqt)]
-
+    xargs: List[str] = []
     if gen3d:
-        cmd.append("--gen3d")
-    if add_h:
-        cmd.append("-h")
-    if ph is not None:
-        cmd.extend(["-p", str(float(ph))])
-    if partialcharge:
-        cmd.extend(["--partialcharge", str(partialcharge)])
+        xargs.append("--gen3d")
     if extra_args:
-        cmd.extend(list(extra_args))
+        xargs.extend(list(extra_args))
 
-    code, out, err = _run_cmd(cmd)
-    if code != 0 or (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
-        raise OpenBabelError(
-            "OpenBabel ligand conversion failed.\n"
-            f"CMD: {' '.join(cmd)}\n"
-            f"Return code: {code}\n"
-            f"STDOUT(tail): {out[-2000:]}\n"
-            f"STDERR(tail): {err[-2000:]}\n"
-        )
-
-    return out_pdbqt
+    return _obabel_to_pdbqt_and_sanitize(
+        in_file=ligand_in,
+        out_pdbqt=out_pdbqt,
+        obabel_exe=obabel_exe,
+        add_h=add_h,
+        partialcharge=partialcharge,
+        ph=ph,
+        extra_args=xargs if xargs else None,
+    )
 
 
 def prepare_cognate_ligand_pdbqt_from_crystal(
@@ -308,7 +383,7 @@ def batch_prepare_receptors_from_pdb(
     """
     Batch helper:
       - optionally strip crystal PDB -> receptor.pdb
-      - convert receptor.pdb -> receptor.pdbqt
+      - convert receptor.pdb -> receptor.pdbqt (sanitized)
     """
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -343,8 +418,10 @@ def batch_prepare_receptors_from_pdb(
 
     return out_paths
 
-from typing import Dict, Tuple, List
-import numpy as np
+
+# =========================
+# Geometry helpers (Kabsch + graft)
+# =========================
 
 def kabsch(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -357,7 +434,7 @@ def kabsch(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     X = P - Pc
     Y = Q - Qc
     C = X.T @ Y
-    V, S, Wt = np.linalg.svd(C)
+    V, _S, Wt = np.linalg.svd(C)
     d = np.sign(np.linalg.det(V @ Wt))
     D = np.diag([1.0, 1.0, d])
     R = V @ D @ Wt
@@ -374,12 +451,10 @@ def write_ca_trace_pdb(
 ) -> Path:
     """
     Write a CA-only PDB using ATOM records with correct chain/resi/resname.
-    This is the input for PULCHRA.
     """
     out_pdb = Path(out_pdb).expanduser().resolve()
     out_pdb.parent.mkdir(parents=True, exist_ok=True)
 
-    # 3-letter mapping (minimal; extend if needed)
     aa3 = {
         "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
         "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
@@ -411,7 +486,6 @@ def write_ca_trace_pdb(
         serial += 1
         atoms.append(a)
 
-    # do NOT carry other lines (avoid CONECT etc)
     write_pdb(out_pdb, atoms=atoms, other_lines=None)
     return out_pdb
 
@@ -436,7 +510,6 @@ def graft_fragment_allatom_into_crystal(
     crystal_atoms, _ = parse_pdb_atoms(crystal_pdb, keep_hetatm=True)
     frag_atoms, _ = parse_pdb_atoms(fragment_allatom_pdb, keep_hetatm=True)
 
-    # Build a set of (chain, resseq) that will be replaced
     repl = set((chain_id, r) for r in range(int(res_start), int(res_end) + 1))
 
     kept: List[AtomRecord] = []
@@ -445,7 +518,6 @@ def graft_fragment_allatom_into_crystal(
             continue
         kept.append(a)
 
-    # Keep fragment atoms only in the replacement range/chain
     frag_keep: List[AtomRecord] = []
     for a in frag_atoms:
         if a.chain_id != chain_id:
@@ -453,11 +525,9 @@ def graft_fragment_allatom_into_crystal(
         if int(res_start) <= int(a.resseq) <= int(res_end):
             frag_keep.append(a)
 
-    # Re-number serials cleanly
     merged = kept + frag_keep
     for i, a in enumerate(merged, start=1):
         a.serial = i
 
     write_pdb(out_pdb, atoms=merged, other_lines=None)
     return out_pdb
-
