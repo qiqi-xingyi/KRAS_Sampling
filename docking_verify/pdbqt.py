@@ -3,36 +3,40 @@
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:pdbqt.py
-
+# docking_verify/pdbqt.py
+# -*- coding: utf-8 -*-
 
 """
-OpenBabel-based receptor/ligand PDBQT preparation utilities (Vina 1.2.5 friendly).
+docking_verify.pdbqt
+
+OpenBabel-based receptor/ligand PDBQT preparation utilities,
+with strict post-sanitization to be compatible with AutoDock Vina v1.2.5.
 
 Key goals
 ---------
-1) Crystal/hybrid PDB -> receptor-only PDB (remove CONECT and other lines).
-2) Crystal PDB -> extract ligand by resname -> ligand-only PDB (clean).
-3) OpenBabel convert to PDBQT:
-   - receptor: use -xr (rigid), add H, gasteiger
-   - ligand  : add H, gasteiger (gen3d optional; default False for crystal ligand)
-4) Sanitize PDBQT for strict Vina 1.2.5:
-   - remove ROOT/BRANCH/TORSDOF tags
-   - remove MODEL/ENDMDL and keep only first model payload
-   - fix atom name field (remove non-alnum, e.g., C4' -> C4P)
-   - fix charge token like '+0.178' -> ' 0.178' (preserve width)
-   - force ligand records to HETATM (more robust for some builds)
+1) Always produce Vina-parseable PDBQT:
+   - No ROOT/BRANCH/TORSDOF blocks (Vina 1.2.5 in your build rejects ROOT)
+   - No multi-MODEL blocks (keep first MODEL only)
+   - Ligand ATOM/HETATM lines are rewritten to Vina-friendly whitespace format:
+        record serial name res chain resi x y z q type
+     (drop vdW/Elec placeholders like "0.00 0.00", strip leading '+' in charge)
+   - Atom names are normalized (e.g., C4' -> C4P) to avoid parser issues.
 
-This file intentionally avoids extra dependencies. Only requires:
-- OpenBabel executable (obabel)
+2) Keep dependencies minimal:
+   - Uses OpenBabel CLI (obabel) only.
+   - No Meeko, no Pulchra, no ProDy required for this module.
+
+This module is designed to be imported and called by docking_verify.pipeline.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple, Union
-import re
 import shutil
 import subprocess
+
+from .pdbio import AtomRecord, parse_pdb_atoms, write_pdb
 
 
 # =========================
@@ -44,7 +48,7 @@ class OpenBabelError(RuntimeError):
 
 
 # =========================
-# Small helpers
+# Helpers
 # =========================
 
 def _ensure_dir(p: Path) -> Path:
@@ -52,60 +56,187 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
-def _which_exe(exe: str) -> str:
-    p = shutil.which(exe) if not Path(exe).exists() else str(Path(exe).expanduser().resolve())
-    if not p:
-        raise OpenBabelError(f"Cannot find executable: {exe}")
-    return p
-
-
-def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return int(proc.returncode), proc.stdout or "", proc.stderr or ""
-
-
 def _tail(s: str, n: int = 2000) -> str:
     return (s or "")[-n:]
 
 
+def _which(exe: str) -> str:
+    p = shutil.which(exe)
+    if not p:
+        raise OpenBabelError(f"Cannot find executable '{exe}' in PATH.")
+    return p
+
+
+def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out, err = proc.communicate()
+    return int(proc.returncode), out or "", err or ""
+
+
+def _sanitize_atom_name(name: str) -> str:
+    """
+    Vina parsers can be picky with non-alnum characters in atom names (e.g., C4').
+    We map non-alnum -> 'P' and ensure length<=4 (pad to 4).
+    """
+    s = "".join(c if c.isalnum() else "P" for c in (name or "X"))
+    s = s[:4]
+    return s.ljust(4)
+
+
+def _keep_first_model(lines: List[str]) -> List[str]:
+    """
+    If there are MODEL/ENDMDL blocks, keep only the first MODEL.
+    If no MODEL tags, return unchanged.
+    """
+    has_model = any(l.lstrip().startswith("MODEL") for l in lines)
+    if not has_model:
+        return lines
+
+    kept: List[str] = []
+    model_idx = 0
+    in_first = False
+
+    for l in lines:
+        s = l.lstrip()
+        if s.startswith("MODEL"):
+            model_idx += 1
+            in_first = (model_idx == 1)
+            continue
+        if s.startswith("ENDMDL"):
+            if model_idx == 1:
+                in_first = False
+            continue
+        if in_first:
+            kept.append(l)
+
+    return kept
+
+
+def sanitize_receptor_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
+    """
+    Receptor must be rigid. Remove torsion-tree tags and multi-model.
+    """
+    p = Path(pdbqt_path).expanduser().resolve()
+    if not p.exists() or p.stat().st_size == 0:
+        return
+
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = _keep_first_model(lines)
+
+    drop_prefix = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF", "MODEL", "ENDMDL")
+
+    out_lines: List[str] = []
+    for l in lines:
+        s = l.lstrip()
+        if not s:
+            continue
+        if s.startswith(drop_prefix):
+            continue
+        # keep ATOM/HETATM/REMARK, drop others if you want; Vina usually tolerates REMARK/TER/END
+        out_lines.append(l)
+
+    p.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+
+def sanitize_ligand_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
+    """
+    Make ligand PDBQT compatible with your Vina v1.2.5 build.
+
+    Fixes:
+    - keep first MODEL only
+    - remove ROOT/BRANCH/TORSDOF
+    - rewrite ATOM/HETATM lines into:
+        HETATM serial name res chain resi x y z q type
+      dropping possible "vdW Elec" columns from OpenBabel:
+        ... x y z 0.00 0.00 +0.178 C
+      -> ... x y z 0.178 C
+    - strip leading '+' in charge
+    - normalize atom name (e.g., C4' -> C4P)
+    """
+    p = Path(pdbqt_path).expanduser().resolve()
+    if not p.exists() or p.stat().st_size == 0:
+        return
+
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = _keep_first_model(lines)
+
+    drop_prefix = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF", "MODEL", "ENDMDL")
+
+    out_lines: List[str] = []
+    for l in lines:
+        s = l.lstrip()
+        if not s:
+            continue
+
+        if s.startswith(drop_prefix):
+            continue
+
+        if s.startswith("REMARK"):
+            # keep remarks (optional)
+            out_lines.append(l)
+            continue
+
+        if s.startswith("ATOM") or s.startswith("HETATM"):
+            parts = s.split()
+
+            # Two common shapes:
+            # (A) "extended" OpenBabel-like:
+            #     ATOM serial name res chain resi x y z vdw elec q type   (>=13 tokens)
+            # (B) already vina-like:
+            #     ATOM serial name res chain resi x y z q type           (>=11 tokens)
+            serial = name = res = chain = resi = None
+            x = y = z = None
+            q = None
+            atype = None
+
+            if len(parts) >= 13:
+                serial, name, res, chain, resi = parts[1], parts[2], parts[3], parts[4], parts[5]
+                x, y, z = parts[6], parts[7], parts[8]
+                q = parts[11]
+                atype = parts[12]
+            elif len(parts) >= 11:
+                serial, name, res, chain, resi = parts[1], parts[2], parts[3], parts[4], parts[5]
+                x, y, z = parts[6], parts[7], parts[8]
+                q = parts[9]
+                atype = parts[10]
+            else:
+                # malformed -> drop
+                continue
+
+            # charge cleanup
+            q = q.strip()
+            if q.startswith("+"):
+                q = q[1:]
+
+            # normalize atom name
+            name_fixed = _sanitize_atom_name(name)
+
+            # write a Vina-friendly whitespace format
+            # record serial name res chain resi x y z q type
+            try:
+                out_lines.append(
+                    f"HETATM{int(serial):>5} {name_fixed}{res:>4} {chain:1}{int(resi):>4}"
+                    f"    {float(x):>8.3f}{float(y):>8.3f}{float(z):>8.3f}"
+                    f"{float(q):>8.3f} {atype:<2}"
+                )
+            except Exception:
+                # if any parse fails, drop the line
+                continue
+
+            continue
+
+        # drop everything else to keep ligand clean
+
+    p.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+
 # =========================
-# PDB line parsing helpers (minimal, robust)
-# =========================
-
-def _pdb_resname(line: str) -> str:
-    # PDB: columns 18-20 (1-based), python [17:20]
-    if len(line) >= 20:
-        return line[17:20].strip()
-    # fallback: token
-    toks = line.split()
-    return toks[3] if len(toks) > 3 else ""
-
-
-def _pdb_chain_id(line: str) -> str:
-    # PDB: column 22 (1-based), python [21]
-    if len(line) >= 22:
-        return line[21].strip()
-    toks = line.split()
-    return toks[4] if len(toks) > 4 else ""
-
-
-def _pdb_is_water_resname(res: str) -> bool:
-    return res.upper() in {"HOH", "WAT", "H2O"}
-
-
-def _write_pdb_lines(out_pdb: Union[str, Path], lines: List[str]) -> Path:
-    out_pdb = Path(out_pdb).expanduser().resolve()
-    _ensure_dir(out_pdb.parent)
-    # Write minimal PDB; avoid CONECT/MASTER/END weirdness
-    with out_pdb.open("w", encoding="utf-8") as f:
-        for l in lines:
-            f.write(l.rstrip("\n") + "\n")
-        f.write("END\n")
-    return out_pdb
-
-
-# =========================
-# Step 1: Strip receptor PDB
+# PDB preparation
 # =========================
 
 def strip_to_receptor_pdb(
@@ -117,101 +248,120 @@ def strip_to_receptor_pdb(
     water_resnames: Optional[Set[str]] = None,
 ) -> Path:
     """
-    Strip a PDB to receptor-only PDB lines.
+    Strip a crystal/hybrid PDB to receptor-only PDB.
 
-    - Keeps ATOM always
-    - HETATM:
-        - remove ligand/water by upstream logic; here we only apply:
-            remove water if remove_water
-            keep if keep_hetatm True OR resname in keep_het_resnames
-        - otherwise drop
-    - Drops all other records (including CONECT) to avoid OpenBabel parseConectRecord issues
+    IMPORTANT:
+    - We do NOT preserve other_lines (CONECT can become inconsistent and breaks OpenBabel).
+    - By default, remove waters and the co-crystal ligand should be removed elsewhere.
     """
     in_pdb = Path(in_pdb).expanduser().resolve()
     out_pdb = Path(out_pdb).expanduser().resolve()
     _ensure_dir(out_pdb.parent)
 
-    keep_het_resnames = {x.upper() for x in (keep_het_resnames or set())}
-    water_resnames = {x.upper() for x in (water_resnames or {"HOH", "WAT", "H2O"})}
+    keep_het_resnames = set(x.upper() for x in (keep_het_resnames or set()))
+    water_resnames = set(x.upper() for x in (water_resnames or {"HOH", "WAT", "H2O"}))
 
-    kept: List[str] = []
-    for line in in_pdb.read_text(encoding="utf-8", errors="ignore").splitlines():
-        rec = line[:6].strip()
+    atoms, _other_lines = parse_pdb_atoms(in_pdb, keep_hetatm=True)
+
+    kept: List[AtomRecord] = []
+    for a in atoms:
+        rec = a.record.strip().upper()
+        resn = (a.resname or "").strip().upper()
+
         if rec == "ATOM":
-            kept.append(line)
+            kept.append(a)
             continue
+
         if rec == "HETATM":
-            rn = _pdb_resname(line).upper()
-            if remove_water and rn in water_resnames:
+            if remove_water and resn in water_resnames:
                 continue
-            if keep_hetatm or (rn in keep_het_resnames):
-                kept.append(line)
-            continue
-        # drop all others
+            if keep_hetatm:
+                kept.append(a)
+                continue
+            if resn in keep_het_resnames:
+                kept.append(a)
+                continue
 
-    return _write_pdb_lines(out_pdb, kept)
+    # renumber serials
+    for i, a in enumerate(kept, start=1):
+        a.serial = i
 
+    write_pdb(out_pdb, atoms=kept, other_lines=None)
+    return out_pdb
 
-# =========================
-# Step 2: Extract ligand PDB
-# =========================
 
 def extract_ligand_pdb_from_crystal(
     crystal_pdb: Union[str, Path],
     out_ligand_pdb: Union[str, Path],
     ligand_resname: str,
     chain_id: Optional[str] = None,
-    allow_atom_records: bool = True,
+    pick_first_instance: bool = True,
     exclude_resnames: Optional[Set[str]] = None,
-) -> Path:
+) -> Tuple[Path, str]:
     """
-    Extract ligand lines by residue name (prefer HETATM).
+    Extract ligand atoms from a crystal PDB by residue name (e.g., GDP).
+
+    Returns:
+      (ligand_pdb_path, instance_key)
+
+    instance_key is like "A:201" for the chosen residue instance, which helps debugging.
+
+    Behavior:
+    - Collect all HETATM with resname == ligand_resname (optionally chain-filtered)
+    - If pick_first_instance=True, choose only one residue instance (chain+resseq+icode)
+      to avoid multi-molecule -> multi-MODEL output from OpenBabel.
     """
     crystal_pdb = Path(crystal_pdb).expanduser().resolve()
     out_ligand_pdb = Path(out_ligand_pdb).expanduser().resolve()
     _ensure_dir(out_ligand_pdb.parent)
 
     ligand_resname = ligand_resname.strip().upper()
-    exclude_resnames = {x.upper() for x in (exclude_resnames or {"HOH", "WAT", "H2O"})}
+    exclude_resnames = set(x.upper() for x in (exclude_resnames or {"HOH", "WAT", "H2O"}))
 
-    het: List[str] = []
-    atm: List[str] = []
+    atoms, _other = parse_pdb_atoms(crystal_pdb, keep_hetatm=True)
 
-    for line in crystal_pdb.read_text(encoding="utf-8", errors="ignore").splitlines():
-        rec = line[:6].strip()
-        if rec not in {"HETATM", "ATOM"}:
+    lig: List[AtomRecord] = []
+    for a in atoms:
+        if a.record.strip().upper() != "HETATM":
             continue
-        rn = _pdb_resname(line).upper()
-        if rn in exclude_resnames:
+        resn = (a.resname or "").strip().upper()
+        if resn in exclude_resnames:
             continue
-        if rn != ligand_resname:
+        if resn != ligand_resname:
             continue
-        if chain_id is not None:
-            ch = _pdb_chain_id(line)
-            if ch != chain_id:
-                continue
-        if rec == "HETATM":
-            het.append(line)
-        else:
-            atm.append(line)
+        if chain_id is not None and (a.chain or "") != chain_id:
+            continue
+        lig.append(a)
 
-    lig_lines = het if het else (atm if allow_atom_records else [])
-    if not lig_lines:
-        raise ValueError(f"Cannot find ligand resname '{ligand_resname}' in {crystal_pdb} (chain={chain_id}).")
+    if not lig:
+        raise ValueError(f"Cannot find ligand resname '{ligand_resname}' in {crystal_pdb} (chain_id={chain_id}).")
 
-    # Force ligand to HETATM for stability
-    lig_out: List[str] = []
-    for l in lig_lines:
-        if l.startswith("ATOM"):
-            lig_out.append("HETATM" + l[6:])
-        else:
-            lig_out.append(l)
+    # group by instance (chain, resseq, icode)
+    def key(a: AtomRecord) -> Tuple[str, int, str]:
+        return (a.chain or "", int(a.resseq), a.icode or "")
 
-    return _write_pdb_lines(out_ligand_pdb, lig_out)
+    if pick_first_instance:
+        groups: dict[Tuple[str, int, str], List[AtomRecord]] = {}
+        for a in lig:
+            groups.setdefault(key(a), []).append(a)
+        chosen_key = sorted(groups.keys(), key=lambda t: (t[0], t[1], t[2]))[0]
+        lig_atoms = groups[chosen_key]
+        instance_key = f"{chosen_key[0]}:{chosen_key[1]}{chosen_key[2]}"
+    else:
+        lig_atoms = lig
+        # if multiple instances merged, instance_key is generic
+        instance_key = "any"
+
+    # renumber serials
+    for i, a in enumerate(lig_atoms, start=1):
+        a.serial = i
+
+    write_pdb(out_ligand_pdb, atoms=lig_atoms, other_lines=None)
+    return out_ligand_pdb, instance_key
 
 
 # =========================
-# Step 3: OpenBabel conversion
+# OpenBabel conversion
 # =========================
 
 def prepare_receptor_pdbqt_obabel(
@@ -222,14 +372,16 @@ def prepare_receptor_pdbqt_obabel(
     partialcharge: Optional[str] = "gasteiger",
     ph: Optional[float] = None,
     extra_args: Optional[Sequence[str]] = None,
+    sanitize: bool = True,
 ) -> Path:
     """
-    Convert receptor PDB to rigid PDBQT using OpenBabel.
+    Convert receptor PDB to PDBQT using OpenBabel.
 
-    IMPORTANT: -xr is critical to avoid ROOT/BRANCH in receptor PDBQT.
+    Critical:
+    - We pass -xr to force rigid receptor output (no torsion tree).
+    - Then sanitize to remove any remaining torsion/multi-model tags.
     """
-    obabel = _which_exe(obabel_exe)
-
+    obabel = _which(obabel_exe)
     receptor_pdb = Path(receptor_pdb).expanduser().resolve()
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     _ensure_dir(out_pdbqt.parent)
@@ -245,15 +397,23 @@ def prepare_receptor_pdbqt_obabel(
     if extra_args:
         cmd.extend(list(extra_args))
 
-    rc, so, se = _run_cmd(cmd)
-    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+    rc, out, err = _run_cmd(cmd)
+    if rc != 0 or (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
         raise OpenBabelError(
             "OpenBabel receptor conversion failed.\n"
             f"CMD: {' '.join(cmd)}\n"
-            f"RC: {rc}\nSTDOUT(tail): {_tail(so)}\nSTDERR(tail): {_tail(se)}\n"
+            f"RC: {rc}\n"
+            f"STDOUT(tail): {_tail(out)}\n"
+            f"STDERR(tail): {_tail(err)}\n"
         )
 
-    sanitize_receptor_pdbqt_for_vina125(out_pdbqt)
+    if sanitize:
+        sanitize_receptor_pdbqt_for_vina125(out_pdbqt)
+
+    # final check
+    if out_pdbqt.stat().st_size == 0:
+        raise OpenBabelError(f"Receptor PDBQT became empty after sanitization: {out_pdbqt}")
+
     return out_pdbqt
 
 
@@ -266,18 +426,24 @@ def prepare_ligand_pdbqt_obabel(
     partialcharge: Optional[str] = "gasteiger",
     ph: Optional[float] = None,
     extra_args: Optional[Sequence[str]] = None,
+    sanitize: bool = True,
 ) -> Path:
     """
-    Convert ligand file to PDBQT using OpenBabel.
-    For crystal ligands, gen3d should usually be False.
+    Convert ligand file (PDB/SDF/MOL2/...) to PDBQT using OpenBabel,
+    then rewrite into a strict Vina v1.2.5-friendly PDBQT.
+
+    Notes:
+    - For crystal ligands (PDB), gen3d should be False (keep original 3D).
+    - Your Vina build rejects ROOT/BRANCH, so we sanitize them away.
     """
-    obabel = _which_exe(obabel_exe)
+    obabel = _which(obabel_exe)
 
     ligand_in = Path(ligand_in).expanduser().resolve()
     out_pdbqt = Path(out_pdbqt).expanduser().resolve()
     _ensure_dir(out_pdbqt.parent)
 
     cmd: List[str] = [obabel, str(ligand_in), "-O", str(out_pdbqt)]
+
     if gen3d:
         cmd.append("--gen3d")
     if add_h:
@@ -289,15 +455,23 @@ def prepare_ligand_pdbqt_obabel(
     if extra_args:
         cmd.extend(list(extra_args))
 
-    rc, so, se = _run_cmd(cmd)
-    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+    rc, out, err = _run_cmd(cmd)
+    if rc != 0 or (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
         raise OpenBabelError(
             "OpenBabel ligand conversion failed.\n"
             f"CMD: {' '.join(cmd)}\n"
-            f"RC: {rc}\nSTDOUT(tail): {_tail(so)}\nSTDERR(tail): {_tail(se)}\n"
+            f"RC: {rc}\n"
+            f"STDOUT(tail): {_tail(out)}\n"
+            f"STDERR(tail): {_tail(err)}\n"
         )
 
-    sanitize_ligand_pdbqt_for_vina125(out_pdbqt)
+    if sanitize:
+        sanitize_ligand_pdbqt_for_vina125(out_pdbqt)
+
+    # final check
+    if out_pdbqt.stat().st_size == 0:
+        raise OpenBabelError(f"Ligand PDBQT became empty after sanitization: {out_pdbqt}")
+
     return out_pdbqt
 
 
@@ -312,13 +486,22 @@ def prepare_cognate_ligand_pdbqt_from_crystal(
     partialcharge: Optional[str] = "gasteiger",
     ph: Optional[float] = None,
     extra_args: Optional[Sequence[str]] = None,
-) -> Tuple[Path, Path]:
-    lig_pdb = extract_ligand_pdb_from_crystal(
+) -> Tuple[Path, Path, str]:
+    """
+    One-shot helper:
+      crystal PDB -> extract ligand (PDB) -> convert ligand PDBQT -> sanitize for Vina 1.2.5
+
+    Returns:
+      (ligand_pdb_path, ligand_pdbqt_path, instance_key)
+    """
+    lig_pdb, instance_key = extract_ligand_pdb_from_crystal(
         crystal_pdb=crystal_pdb,
         out_ligand_pdb=out_ligand_pdb,
         ligand_resname=ligand_resname,
         chain_id=chain_id,
+        pick_first_instance=True,
     )
+
     lig_pdbqt = prepare_ligand_pdbqt_obabel(
         ligand_in=lig_pdb,
         out_pdbqt=out_ligand_pdbqt,
@@ -328,158 +511,11 @@ def prepare_cognate_ligand_pdbqt_from_crystal(
         partialcharge=partialcharge,
         ph=ph,
         extra_args=extra_args,
+        sanitize=True,
     )
-    return lig_pdb, lig_pdbqt
 
+    return lig_pdb, lig_pdbqt, instance_key
 
-# =========================
-# Step 4: PDBQT sanitize for Vina 1.2.5
-# =========================
-
-_BAD_PREFIX = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF")
-
-# charge token appears near end; we preserve width by replacing "+x.y" -> " x.y"
-_CHARGE_TAIL_RE = re.compile(r"(.*\s)([+\-]?\d+(?:\.\d+)?)(\s+[A-Za-z0-9]+)\s*$")
-
-
-def _keep_only_first_model_payload(lines: List[str]) -> List[str]:
-    has_model = any(l.lstrip().startswith("MODEL") for l in lines)
-    if not has_model:
-        return lines
-    out: List[str] = []
-    model_idx = 0
-    in_first = False
-    for l in lines:
-        s = l.lstrip()
-        if s.startswith("MODEL"):
-            model_idx += 1
-            in_first = (model_idx == 1)
-            continue
-        if s.startswith("ENDMDL"):
-            if model_idx == 1:
-                in_first = False
-            continue
-        if in_first:
-            out.append(l)
-    return out
-
-
-def _fix_atom_name_field_fixedwidth(line: str) -> str:
-    """
-    Fix PDB/PDBQT atom name field (columns 13-16, python [12:16]).
-    Replace non-alnum with 'P'. Keep width 4.
-    """
-    if len(line) < 16:
-        return line
-    name = line[12:16]
-    fixed = "".join((c if c.isalnum() else "P") for c in name)
-    fixed = fixed[:4].ljust(4)
-    return line[:12] + fixed + line[16:]
-
-
-def _fix_charge_tail_preserve_width(line: str) -> str:
-    """
-    Convert charge like '+0.178' to ' 0.178' while preserving string length.
-    Applies only if the tail matches '<spaces><charge><spaces><atomtype>'.
-    """
-    m = _CHARGE_TAIL_RE.match(line.rstrip("\n"))
-    if not m:
-        return line
-    head, charge, tail = m.group(1), m.group(2), m.group(3)
-    if charge.startswith("+"):
-        # replace leading '+' with space to keep width
-        charge2 = " " + charge[1:]
-        return f"{head}{charge2}{tail}"
-    return line
-
-
-def sanitize_ligand_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
-    """
-    Make ligand PDBQT compatible with strict Vina 1.2.5:
-    - drop ROOT/BRANCH/TORSDOF lines
-    - keep only first MODEL payload; remove MODEL/ENDMDL
-    - keep only REMARK/ATOM/HETATM
-    - force record to HETATM (ligand)
-    - fix atom name field (no quotes)
-    - fix '+0.xxx' charge format
-    """
-    p = Path(pdbqt_path).expanduser().resolve()
-    if not p.exists() or p.stat().st_size == 0:
-        return
-
-    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-
-    # drop torsion tree and empty
-    tmp: List[str] = []
-    for l in lines:
-        s = l.lstrip()
-        if not s:
-            continue
-        if s.startswith(_BAD_PREFIX):
-            continue
-        tmp.append(l)
-
-    tmp = _keep_only_first_model_payload(tmp)
-
-    cleaned: List[str] = []
-    for l in tmp:
-        s = l.lstrip()
-        if s.startswith("REMARK"):
-            cleaned.append(l)
-            continue
-        if s.startswith("ATOM") or s.startswith("HETATM"):
-            # force ligand record to HETATM
-            if l.startswith("ATOM"):
-                l = "HETATM" + l[6:]
-            l = _fix_atom_name_field_fixedwidth(l)
-            l = _fix_charge_tail_preserve_width(l)
-            cleaned.append(l)
-            continue
-        # drop everything else
-
-    p.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
-
-
-def sanitize_receptor_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
-    """
-    Receptor should be rigid. We still sanitize in case tools inject ROOT/BRANCH or MODEL tags.
-    Keep only first model, drop torsion tags, keep REMARK/ATOM/HETATM.
-    """
-    p = Path(pdbqt_path).expanduser().resolve()
-    if not p.exists() or p.stat().st_size == 0:
-        return
-
-    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-
-    tmp: List[str] = []
-    for l in lines:
-        s = l.lstrip()
-        if not s:
-            continue
-        if s.startswith(_BAD_PREFIX):
-            continue
-        tmp.append(l)
-
-    tmp = _keep_only_first_model_payload(tmp)
-
-    cleaned: List[str] = []
-    for l in tmp:
-        s = l.lstrip()
-        if s.startswith("REMARK"):
-            cleaned.append(l)
-            continue
-        if s.startswith("ATOM") or s.startswith("HETATM"):
-            l = _fix_atom_name_field_fixedwidth(l)
-            l = _fix_charge_tail_preserve_width(l)
-            cleaned.append(l)
-            continue
-
-    p.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
-
-
-# =========================
-# Batch helper
-# =========================
 
 def batch_prepare_receptors_from_pdb(
     receptor_pdbs: Iterable[Union[str, Path]],
@@ -493,6 +529,11 @@ def batch_prepare_receptors_from_pdb(
     partialcharge: Optional[str] = "gasteiger",
     ph: Optional[float] = None,
 ) -> List[Path]:
+    """
+    Batch helper:
+      - optionally strip -> receptor.pdb
+      - convert receptor.pdb -> receptor.pdbqt (rigid) + sanitize
+    """
     out_dir = Path(out_dir).expanduser().resolve()
     _ensure_dir(out_dir)
 
@@ -521,8 +562,10 @@ def batch_prepare_receptors_from_pdb(
                 add_h=add_h,
                 partialcharge=partialcharge,
                 ph=ph,
+                sanitize=True,
             )
         )
 
     return out_paths
+
 
