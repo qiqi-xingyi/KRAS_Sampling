@@ -342,3 +342,122 @@ def batch_prepare_receptors_from_pdb(
         )
 
     return out_paths
+
+from typing import Dict, Tuple, List
+import numpy as np
+
+def kabsch(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Find R,t s.t. R*P + t ~= Q
+    P, Q: (N,3)
+    """
+    assert P.shape == Q.shape and P.shape[1] == 3
+    Pc = P.mean(axis=0)
+    Qc = Q.mean(axis=0)
+    X = P - Pc
+    Y = Q - Qc
+    C = X.T @ Y
+    V, S, Wt = np.linalg.svd(C)
+    d = np.sign(np.linalg.det(V @ Wt))
+    D = np.diag([1.0, 1.0, d])
+    R = V @ D @ Wt
+    t = Qc - R @ Pc
+    return R, t
+
+
+def write_ca_trace_pdb(
+    out_pdb: Union[str, Path],
+    chain_id: str,
+    res_start: int,
+    sequence: str,
+    ca_xyz: List[List[float]],
+) -> Path:
+    """
+    Write a CA-only PDB using ATOM records with correct chain/resi/resname.
+    This is the input for PULCHRA.
+    """
+    out_pdb = Path(out_pdb).expanduser().resolve()
+    out_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+    # 3-letter mapping (minimal; extend if needed)
+    aa3 = {
+        "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+        "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
+        "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+        "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+    }
+
+    atoms: List[AtomRecord] = []
+    serial = 1
+    for i, (aa1, xyz) in enumerate(zip(sequence, ca_xyz)):
+        resi = int(res_start + i)
+        resname = aa3.get(aa1, "GLY")
+        x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        a = AtomRecord(
+            record="ATOM",
+            serial=serial,
+            name="CA",
+            altloc="",
+            resname=resname,
+            chain_id=chain_id,
+            resseq=resi,
+            icode="",
+            x=x, y=y, z=z,
+            occupancy=1.00,
+            tempfactor=0.00,
+            element="C",
+            charge="",
+        )
+        serial += 1
+        atoms.append(a)
+
+    # do NOT carry other lines (avoid CONECT etc)
+    write_pdb(out_pdb, atoms=atoms, other_lines=None)
+    return out_pdb
+
+
+def graft_fragment_allatom_into_crystal(
+    crystal_pdb: Union[str, Path],
+    fragment_allatom_pdb: Union[str, Path],
+    chain_id: str,
+    res_start: int,
+    res_end: int,
+    out_pdb: Union[str, Path],
+) -> Path:
+    """
+    Replace residues [res_start, res_end] in crystal_pdb(chain_id) with atoms from fragment_allatom_pdb.
+    Assumes fragment_allatom_pdb uses the same chain_id and residue numbering.
+    """
+    crystal_pdb = Path(crystal_pdb).expanduser().resolve()
+    fragment_allatom_pdb = Path(fragment_allatom_pdb).expanduser().resolve()
+    out_pdb = Path(out_pdb).expanduser().resolve()
+    out_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+    crystal_atoms, _ = parse_pdb_atoms(crystal_pdb, keep_hetatm=True)
+    frag_atoms, _ = parse_pdb_atoms(fragment_allatom_pdb, keep_hetatm=True)
+
+    # Build a set of (chain, resseq) that will be replaced
+    repl = set((chain_id, r) for r in range(int(res_start), int(res_end) + 1))
+
+    kept: List[AtomRecord] = []
+    for a in crystal_atoms:
+        if (a.chain_id, a.resseq) in repl:
+            continue
+        kept.append(a)
+
+    # Keep fragment atoms only in the replacement range/chain
+    frag_keep: List[AtomRecord] = []
+    for a in frag_atoms:
+        if a.chain_id != chain_id:
+            continue
+        if int(res_start) <= int(a.resseq) <= int(res_end):
+            frag_keep.append(a)
+
+    # Re-number serials cleanly
+    merged = kept + frag_keep
+    for i, a in enumerate(merged, start=1):
+        a.serial = i
+
+    write_pdb(out_pdb, atoms=merged, other_lines=None)
+    return out_pdb
+
