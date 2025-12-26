@@ -1,7 +1,6 @@
-# --*-- conding:utf-8 --*--
-# @time:12/25/25 01:19
+# --*-- coding:utf-8 --*--
+# @time:12/25/25
 # @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
 # @File:pipeline.py
 
 from __future__ import annotations
@@ -124,9 +123,59 @@ def _strip_receptor_atoms(
     return out
 
 
-def _extract_ligand_atoms(atoms: List[PDBAtom], ligand_resname: str) -> List[PDBAtom]:
+def _group_by_ligand_instance(
+    atoms: List[PDBAtom],
+    ligand_resname: str,
+    chain_id: Optional[str] = None,
+) -> Dict[Tuple[str, int, str], List[PDBAtom]]:
+    """
+    Group ligand atoms by (chain, resseq, icode). This avoids multi-ligand outputs that
+    lead to multi-MODEL PDBQT from OpenBabel.
+    """
     lig = ligand_resname.upper()
-    return [a for a in atoms if (a.record.strip() == "HETATM" and a.resname.upper() == lig)]
+    groups: Dict[Tuple[str, int, str], List[PDBAtom]] = {}
+
+    for a in atoms:
+        if a.record.strip() != "HETATM":
+            continue
+        if a.resname.upper() != lig:
+            continue
+        if chain_id is not None and a.chain_id != chain_id:
+            continue
+        key = (a.chain_id, int(a.resseq), getattr(a, "icode", "") or "")
+        groups.setdefault(key, []).append(a)
+
+    return groups
+
+
+def _pick_single_ligand_instance(
+    atoms: List[PDBAtom],
+    ligand_resname: str,
+    chain_id: Optional[str],
+) -> Tuple[List[PDBAtom], str]:
+    """
+    Pick ONE ligand instance to avoid OpenBabel producing multiple MODEL blocks.
+    Strategy:
+    - Prefer instances on requested chain_id
+    - Pick the instance with the most atoms (more complete)
+    - Fallback to first instance if tie
+    Returns (atoms, instance_key_str).
+    """
+    # First try chain-filtered groups
+    groups = _group_by_ligand_instance(atoms, ligand_resname, chain_id=chain_id)
+    if not groups and chain_id is not None:
+        # fallback: ignore chain_id
+        groups = _group_by_ligand_instance(atoms, ligand_resname, chain_id=None)
+
+    if not groups:
+        return [], ""
+
+    items = list(groups.items())
+    # sort by atom count desc, then stable order
+    items.sort(key=lambda kv: len(kv[1]), reverse=True)
+    key, lig_atoms = items[0]
+    k_str = f"{key[0]}:{key[1]}{key[2] or ''}"
+    return lig_atoms, k_str
 
 
 def _centroid(atoms: List[PDBAtom]) -> Tuple[float, float, float]:
@@ -139,126 +188,199 @@ def _centroid(atoms: List[PDBAtom]) -> Tuple[float, float, float]:
 
 
 # -------------------------
-# PDBQT sanitize (CRITICAL)
+# PDBQT sanitize (CRITICAL for Vina 1.2.5)
 # -------------------------
 
-
 _BAD_TORSION_PREFIX = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF")
+_BAD_MODEL_PREFIX = ("MODEL", "ENDMDL")
 
-def _sanitize_pdbqt_common_lines(p: Path) -> List[str]:
-    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-    kept: List[str] = []
+
+def _keep_only_first_model_payload(lines: List[str]) -> List[str]:
+    """
+    If multi-MODEL exists, keep only payload of first MODEL.
+    Remove MODEL/ENDMDL tags.
+    """
+    has_model = any(l.lstrip().startswith("MODEL") for l in lines)
+    if not has_model:
+        # also drop stray ENDMDL just in case
+        return [l for l in lines if not l.lstrip().startswith(_BAD_MODEL_PREFIX)]
+
+    out: List[str] = []
+    model_idx = 0
+    in_first = False
     for l in lines:
+        s = l.lstrip()
+        if s.startswith("MODEL"):
+            model_idx += 1
+            in_first = (model_idx == 1)
+            continue
+        if s.startswith("ENDMDL"):
+            in_first = False
+            continue
+        if in_first:
+            out.append(l)
+    return out
+
+
+def _fix_atom_name_field_pdbqt(name: str) -> str:
+    """
+    Atom name in PDBQT should be <=4 chars, alnum only for strict parsing.
+    Replace non-alnum with 'P'.
+    """
+    fixed = "".join((c if c.isalnum() else "P") for c in name.strip())
+    if not fixed:
+        fixed = "X"
+    return fixed[:4]
+
+
+def _is_float(x: str) -> bool:
+    try:
+        float(x)
+        return True
+    except Exception:
+        return False
+
+
+def _rewrite_atom_line_to_vina125(tokens: List[str]) -> Optional[str]:
+    """
+    Convert an AD4-style PDBQT ATOM/HETATM line into Vina 1.2.5-friendly format.
+
+    Typical AD4 tokens (split):
+      ATOM  1  PC4P  GDP  A  201  13.776  -8.601  -16.173  0.00  0.00  +0.178  C
+    We rewrite to:
+      ATOM      1 PC4P GDP A 201      13.776  -8.601 -16.173  +0.178 C
+
+    We rely on:
+      tokens[0]=ATOM/HETATM
+      tokens[1]=serial
+      tokens[2]=name
+      tokens[3]=resname
+      tokens[4]=chain
+      tokens[5]=resseq
+      tokens[6:9]=x,y,z
+      charge=tokens[-2], type=tokens[-1]
+    """
+    if len(tokens) < 11:
+        return None
+
+    rec = tokens[0]
+    if rec not in ("ATOM", "HETATM"):
+        return None
+
+    # minimal sanity
+    if not (tokens[1].isdigit() or tokens[1].lstrip("-").isdigit()):
+        return None
+    if len(tokens) < 9:
+        return None
+
+    serial = int(tokens[1])
+    name = _fix_atom_name_field_pdbqt(tokens[2])
+    resname = tokens[3]
+    chain = tokens[4]
+    try:
+        resseq = int(tokens[5])
+    except Exception:
+        return None
+
+    # coords
+    if not (_is_float(tokens[6]) and _is_float(tokens[7]) and _is_float(tokens[8])):
+        return None
+    x, y, z = float(tokens[6]), float(tokens[7]), float(tokens[8])
+
+    # charge/type at end
+    if len(tokens) < 2:
+        return None
+    charge_tok = tokens[-2]
+    atype = tokens[-1]
+
+    if not _is_float(charge_tok):
+        # sometimes charge token may look like +0.178 (float ok), if not then fail
+        return None
+    charge = float(charge_tok)
+
+    # Compose a strict-ish line (not perfect fixed columns, but Vina 1.2.5 accepts this style)
+    # Keep it stable and clean.
+    # Note: we intentionally omit vdW/Elec columns.
+    line = (
+        f"{rec:<6}"
+        f"{serial:>5d} "
+        f"{name:<4} "
+        f"{resname:>3} "
+        f"{chain:1}"
+        f"{resseq:>4d}"
+        f"    "
+        f"{x:>8.3f}{y:>8.3f}{z:>8.3f} "
+        f"{charge:>7.3f} "
+        f"{atype}"
+    )
+    return line
+
+
+def _sanitize_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
+    """
+    Strict sanitizer for BOTH receptor and ligand for Vina 1.2.5:
+    - remove ROOT/BRANCH/TORSDOF
+    - remove MODEL/ENDMDL and keep only first MODEL payload
+    - keep only REMARK + ATOM/HETATM
+    - rewrite ATOM/HETATM lines into Vina 1.2.5-friendly format:
+        remove the AD4 vdW/Elec fields and keep only charge+type
+    """
+    p = Path(pdbqt_path).expanduser().resolve()
+    if not p.exists() or p.stat().st_size == 0:
+        return
+
+    raw_lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+    # drop torsion-tree tags early
+    tmp: List[str] = []
+    for l in raw_lines:
         s = l.lstrip()
         if not s:
             continue
         if s.startswith(_BAD_TORSION_PREFIX):
             continue
-        kept.append(l.rstrip("\n"))
-    return kept
+        tmp.append(l.rstrip("\n"))
 
-
-def _fix_atom_name_field(line: str) -> str:
-    """
-    PDB/PDBQT atom name field is columns 13-16 (0-based [12:16]).
-    Replace any non-alnum (e.g., C4') with 'P'.
-    """
-    if len(line) < 16:
-        return line
-    name = line[12:16]
-    fixed = "".join((c if c.isalnum() else "P") for c in name)
-    fixed = fixed[:4].ljust(4)
-    return line[:12] + fixed + line[16:]
-
-
-def _keep_only_first_model_payload(lines: List[str]) -> List[str]:
-    """
-    If multi-MODEL exists, keep only payload of the first MODEL.
-    Remove all MODEL/ENDMDL tags.
-    If no MODEL tag, keep all lines as-is.
-    """
-    model_idx = 0
-    in_model = False
-    out: List[str] = []
-
-    has_any_model = any(l.lstrip().startswith("MODEL") for l in lines)
-    if not has_any_model:
-        return lines
-
-    for l in lines:
-        s = l.lstrip()
-        if s.startswith("MODEL"):
-            model_idx += 1
-            in_model = (model_idx == 1)
-            continue
-        if s.startswith("ENDMDL"):
-            if model_idx == 1:
-                in_model = False
-            continue
-        if model_idx == 1 and in_model:
-            out.append(l)
-        else:
-            # ignore payload from model 2+
-            continue
-
-    return out
-
-
-def _sanitize_ligand_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
-    """
-    Make ligand PDBQT compatible with strict Vina 1.2.5:
-    - remove torsion tree tags (ROOT/BRANCH/TORSDOF...)
-    - keep only first MODEL payload if multi-model exists
-    - remove MODEL/ENDMDL tags entirely (avoid Vina multi-model complaint)
-    - fix atom names with special chars (C4' -> C4P etc)
-    - keep only REMARK/ATOM/HETATM lines (drop others)
-    """
-    p = Path(pdbqt_path).expanduser().resolve()
-    if not p.exists() or p.stat().st_size == 0:
-        return
-
-    lines = _sanitize_pdbqt_common_lines(p)
-    lines = _keep_only_first_model_payload(lines)
+    # model handling
+    tmp = _keep_only_first_model_payload(tmp)
 
     cleaned: List[str] = []
-    for l in lines:
+    for l in tmp:
         s = l.lstrip()
+        if s.startswith("REMARK"):
+            cleaned.append(l.strip("\n"))
+            continue
         if s.startswith("ATOM") or s.startswith("HETATM"):
-            cleaned.append(_fix_atom_name_field(l))
-        elif s.startswith("REMARK"):
-            cleaned.append(l)
-        else:
-            # drop everything else to be strict
+            toks = s.split()
+            new_line = _rewrite_atom_line_to_vina125(toks)
+            if new_line is not None:
+                cleaned.append(new_line)
+            # if cannot rewrite, drop line (better than keeping invalid)
             continue
+        # drop everything else
+        continue
 
     p.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
 
 
-def _sanitize_receptor_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
+def _validate_pdbqt_for_vina125(pdbqt_path: Union[str, Path]) -> None:
     """
-    Receptor must be rigid: remove torsion tree tags if present.
-    Also strip MODEL/ENDMDL if any weirdness appears (keep first model only).
+    Quick validation to catch the common fatal tags before calling Vina.
     """
     p = Path(pdbqt_path).expanduser().resolve()
     if not p.exists() or p.stat().st_size == 0:
-        return
+        raise RuntimeError(f"PDBQT missing/empty: {p}")
 
-    lines = _sanitize_pdbqt_common_lines(p)
-    lines = _keep_only_first_model_payload(lines)
-
-    cleaned: List[str] = []
-    for l in lines:
+    bad_hits: List[str] = []
+    for l in p.read_text(encoding="utf-8", errors="ignore").splitlines():
         s = l.lstrip()
-        if s.startswith("ATOM") or s.startswith("HETATM") or s.startswith("REMARK"):
-            # receptor atom names normally don't have `'`, but fix harmlessly anyway
-            if s.startswith("ATOM") or s.startswith("HETATM"):
-                cleaned.append(_fix_atom_name_field(l))
-            else:
-                cleaned.append(l)
-        else:
-            continue
+        if s.startswith(_BAD_TORSION_PREFIX):
+            bad_hits.append(s.split()[0])
+        if s.startswith(_BAD_MODEL_PREFIX):
+            bad_hits.append(s.split()[0])
+    if bad_hits:
+        raise RuntimeError(f"PDBQT still contains disallowed tags for Vina 1.2.5: {sorted(set(bad_hits))} in {p}")
 
-    p.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
 
 # -------------------------
 # OpenBabel conversion
@@ -283,14 +405,16 @@ def _obabel_to_pdbqt_receptor(
     ]
     rc, so, se, _dt = _run_cmd(cmd)
 
-    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+    # OpenBabel sometimes returns 0 but converts 0 molecules; catch it
+    if ("0 molecules converted" in (so + se)) or (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
         raise RuntimeError(
-            "OpenBabel receptor conversion failed (empty output).\n"
+            "OpenBabel receptor conversion failed.\n"
             f"CMD: {' '.join(cmd)}\n"
             f"RC: {rc}\nSTDOUT(tail): {_tail(so)}\nSTDERR(tail): {_tail(se)}\n"
         )
 
-    _sanitize_receptor_pdbqt_for_vina125(out_pdbqt)
+    _sanitize_pdbqt_for_vina125(out_pdbqt)
+    _validate_pdbqt_for_vina125(out_pdbqt)
     return out_pdbqt
 
 
@@ -312,14 +436,15 @@ def _obabel_to_pdbqt_ligand(
     ]
     rc, so, se, _dt = _run_cmd(cmd)
 
-    if (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
+    if ("0 molecules converted" in (so + se)) or (not out_pdbqt.exists()) or out_pdbqt.stat().st_size == 0:
         raise RuntimeError(
-            "OpenBabel ligand conversion failed (empty output).\n"
+            "OpenBabel ligand conversion failed.\n"
             f"CMD: {' '.join(cmd)}\n"
             f"RC: {rc}\nSTDOUT(tail): {_tail(so)}\nSTDERR(tail): {_tail(se)}\n"
         )
 
-    _sanitize_ligand_pdbqt_for_vina125(out_pdbqt)
+    _sanitize_pdbqt_for_vina125(out_pdbqt)
+    _validate_pdbqt_for_vina125(out_pdbqt)
     return out_pdbqt
 
 
@@ -343,7 +468,7 @@ def run_pipeline(
     strict: bool = False,
 ) -> Dict[str, str]:
     if ligand_mode != "from_crystal":
-        raise RuntimeError("This minimal pipeline only supports ligand_mode='from_crystal'.")
+        raise RuntimeError("This pipeline only supports ligand_mode='from_crystal'.")
 
     out_dir = Path(out_dir).expanduser().resolve()
     _ensure_dir(out_dir)
@@ -413,23 +538,27 @@ def run_pipeline(
         try:
             atoms_all, _other_all = read_pdb_atoms(pdb_path)
 
-            # --- ligand (from crystal) ---
-            lig_atoms = _extract_ligand_atoms(atoms_all, ligand_resname=ligand_resname)
+            # --- ligand (pick ONE instance from crystal) ---
+            lig_atoms, lig_key = _pick_single_ligand_instance(
+                atoms_all, ligand_resname=ligand_resname, chain_id=chain_id
+            )
             if not lig_atoms:
-                raise RuntimeError(f"{case_id}: ligand {ligand_resname} not found in crystal PDB.")
+                raise RuntimeError(f"{case_id}: ligand {ligand_resname} not found in crystal PDB (chain {chain_id}).")
 
-            lig_pdb = dirs["ligands"] / f"{case_id}.{ligand_resname}.pdb"
+            lig_pdb = dirs["ligands"] / f"{case_id}.{ligand_resname}.{lig_key or 'any'}.pdb"
             write_pdb(lig_pdb, lig_atoms, other_lines=None, drop_conect=True)
 
-            lig_pdbqt = dirs["pdbqt_lig"] / f"{case_id}.{ligand_resname}.pdbqt"
+            lig_pdbqt = dirs["pdbqt_lig"] / f"{case_id}.{ligand_resname}.{lig_key or 'any'}.pdbqt"
             if resume and lig_pdbqt.exists() and lig_pdbqt.stat().st_size > 0:
-                _sanitize_ligand_pdbqt_for_vina125(lig_pdbqt)
+                _sanitize_pdbqt_for_vina125(lig_pdbqt)
+                _validate_pdbqt_for_vina125(lig_pdbqt)
             else:
                 _obabel_to_pdbqt_ligand(obabel_exe, lig_pdb, lig_pdbqt)
 
-            case_status["steps"]["ligand_pdb"] = {"path": str(lig_pdb)}
-            case_status["steps"]["ligand_pdbqt"] = {"path": str(lig_pdbqt)}
+            case_status["steps"]["ligand_pdb"] = {"path": str(lig_pdb), "instance": lig_key}
+            case_status["steps"]["ligand_pdbqt"] = {"path": str(lig_pdbqt), "instance": lig_key}
 
+            # box from ligand centroid
             cx, cy, cz = _centroid(lig_atoms)
             box = DockBox(center_x=cx, center_y=cy, center_z=cz, size_x=sx, size_y=sy, size_z=sz)
             case_status["steps"]["box"] = {"center": [cx, cy, cz], "size": [sx, sy, sz]}
@@ -473,7 +602,8 @@ def run_pipeline(
             # --- receptor pdbqt ---
             receptor_pdbqt = dirs["pdbqt_rec"] / f"{case_id}.pdbqt"
             if resume and receptor_pdbqt.exists() and receptor_pdbqt.stat().st_size > 0:
-                _sanitize_receptor_pdbqt_for_vina125(receptor_pdbqt)
+                _sanitize_pdbqt_for_vina125(receptor_pdbqt)
+                _validate_pdbqt_for_vina125(receptor_pdbqt)
             else:
                 _obabel_to_pdbqt_receptor(obabel_exe, receptor_pdb, receptor_pdbqt)
 
