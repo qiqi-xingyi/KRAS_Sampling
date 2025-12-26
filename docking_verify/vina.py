@@ -4,6 +4,8 @@
 # @Email : yzhan135@kent.edu
 # @File:vina.py
 
+# docking_verify/vina.py
+# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 

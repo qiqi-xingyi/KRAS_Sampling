@@ -338,6 +338,21 @@ def run_pipeline(
                 )
             case_status["steps"]["vina_out"] = {"path": str(case_vina_out)}
 
+            # HARD CHECK: require real files
+            missing = []
+            for s in seeds:
+                d = case_vina_out / f"seed_{int(s)}"
+                outp = d / "out.pdbqt"
+                logp = d / "log.txt"
+                if (not outp.exists()) or outp.stat().st_size == 0:
+                    missing.append(str(outp))
+                if (not logp.exists()) or logp.stat().st_size == 0:
+                    missing.append(str(logp))
+            if missing:
+                raise PipelineError("Vina produced no outputs: " + "; ".join(missing))
+
+            case_status["steps"]["vina_out"] = {"path": str(case_vina_out)}
+
             # ---- Step 7: Analyze
             run_metrics = analyze_vina_outputs(
                 out_root=case_vina_out,
