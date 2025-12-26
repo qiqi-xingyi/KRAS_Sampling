@@ -67,13 +67,12 @@ def strip_to_receptor_pdb(
     water_resnames: Optional[Set[str]] = None,
 ) -> Path:
     """
-    Strip a crystal PDB to a receptor-only PDB.
+    Strip a crystal/hybrid PDB to a receptor-only PDB.
 
-    Default:
-      - Keep ATOM records (protein).
-      - Drop all HETATM records (ligands/ions/waters).
-      - Optionally keep selected HET residue names (e.g., {'MG'}).
-      - Optionally remove waters by resname (HOH/WAT/H2O).
+    IMPORTANT:
+    - We intentionally do NOT carry over other_lines from the original PDB,
+      because CONECT records can become inconsistent after hybrid rebuilding,
+      which breaks OpenBabel parsing.
     """
     in_pdb = Path(in_pdb).expanduser().resolve()
     out_pdb = Path(out_pdb).expanduser().resolve()
@@ -82,7 +81,7 @@ def strip_to_receptor_pdb(
     keep_het_resnames = keep_het_resnames or set()
     water_resnames = water_resnames or {"HOH", "WAT", "H2O"}
 
-    atoms, other_lines = parse_pdb_atoms(in_pdb, keep_hetatm=True)
+    atoms, _other_lines = parse_pdb_atoms(in_pdb, keep_hetatm=True)
     kept_atoms: List[AtomRecord] = []
 
     for a in atoms:
@@ -100,7 +99,15 @@ def strip_to_receptor_pdb(
                 kept_atoms.append(a)
                 continue
 
-    write_pdb(out_pdb, atoms=kept_atoms, other_lines=other_lines)
+    # (Optional but recommended) re-number serials to keep PDB clean
+    for i, a in enumerate(kept_atoms, start=1):
+        try:
+            a.serial = i
+        except Exception:
+            pass
+
+    # Scheme A: do NOT write other_lines (avoid CONECT/END/Master issues)
+    write_pdb(out_pdb, atoms=kept_atoms, other_lines=None)
     return out_pdb
 
 
