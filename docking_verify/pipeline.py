@@ -264,28 +264,52 @@ def run_pipeline(
             if ligand_mode == "external":
                 assert external_ligand_pdbqt is not None
                 ligand_pdbqt = external_ligand_pdbqt
-                case_status["steps"]["ligand_pdbqt"] = {"path": str(ligand_pdbqt), "mode": "external"}
+                case_status["steps"]["ligand_pdbqt"] = {
+                    "path": str(ligand_pdbqt),
+                    "mode": "external",
+                    "key": "external",
+                }
 
             else:
-                key = _ligand_cache_key(c.ref_pdb, c.ligand_resname, None)
-                if key in ligand_cache and _file_nonempty(ligand_cache[key]):
-                    ligand_pdbqt = ligand_cache[key]
+                # from_crystal
+                lig_resname = (c.ligand_resname or "").strip()
+                if not lig_resname:
+                    # Optional fallback (if you added detect_primary_ligand_resname)
+                    # from .pdbqt import detect_primary_ligand_resname
+                    # lig_resname = detect_primary_ligand_resname(c.pdb_path)
+                    raise PipelineError("ligand_resname is empty for ligand_mode='from_crystal'.")
+
+                key = _ligand_cache_key(c.ref_pdb, lig_resname, None)
+
+                # Reuse cached ligand pdbqt if present
+                cached = ligand_cache.get(key)
+                if cached is not None and _file_nonempty(cached):
+                    ligand_pdbqt = cached
                 else:
                     lig_pdb = ligands_from_crystal_dir / f"{key}.pdb"
                     lig_pdbqt = pdbqt_ligands_dir / f"{key}.pdbqt"
+
                     if (not resume) or (not _file_nonempty(lig_pdbqt)):
                         prepare_cognate_ligand_pdbqt_from_crystal(
                             crystal_pdb=c.pdb_path,
-                            ligand_resname=c.ligand_resname,
+                            ligand_resname=lig_resname,
                             out_ligand_pdb=lig_pdb,
                             out_ligand_pdbqt=lig_pdbqt,
-                            chain_id=None,  # usually ligand is unique; keep None for robustness
+                            chain_id=None,
                             obabel_exe=obabel_exe,
                             add_h=True,
                             partialcharge="gasteiger",
                         )
+
                     ligand_cache[key] = lig_pdbqt
-                case_status["steps"]["ligand_pdbqt"] = {"path": str(ligand_pdbqt), "mode": "from_crystal", "key": key}
+                    ligand_pdbqt = lig_pdbqt
+
+                case_status["steps"]["ligand_pdbqt"] = {
+                    "path": str(ligand_pdbqt),
+                    "mode": "from_crystal",
+                    "key": key,
+                    "ligand_resname": lig_resname,
+                }
 
             # ---- Step 5: Box from crystal ligand centroid (always use crystal reference)
             box = make_box_from_ligand_centroid(
