@@ -4,16 +4,14 @@
 # @Email : yzhan135@kent.edu
 # @File:meeko_pdbqt.py
 
-# docking_verify/meeko_pdbqt.py
-# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Union, Dict, Tuple, List
+from typing import Optional, Union, List
 import subprocess
-import json
+import time
 
 
 class MeekoError(RuntimeError):
@@ -31,6 +29,13 @@ class MeekoReceptorResult:
     flex_pdbqt: Optional[Path]
     json_path: Optional[Path]
     gpf_path: Optional[Path]
+    # debugging
+    cmd: List[str]
+    returncode: int
+    runtime_sec: float
+    stdout_tail: str
+    stderr_tail: str
+    log_file: Optional[Path]
 
 
 def prepare_receptor_pdbqt_meeko(
@@ -40,52 +45,89 @@ def prepare_receptor_pdbqt_meeko(
     default_altloc: Optional[str] = "A",
     write_json: bool = False,
     write_gpf: bool = False,
+    allow_bad_res: bool = False,
+    timeout_sec: Optional[int] = None,
+    log_file: Optional[Union[str, Path]] = None,
 ) -> MeekoReceptorResult:
     """
     Prepare receptor PDBQT with Meeko CLI.
 
-    Meeko will write:
-      <out_basename>_rigid.pdbqt
-    and optionally:
-      <out_basename>_flex.pdbqt   (if flexible residues requested; we won't use it)
-      <out_basename>.json
-      <out_basename>.gpf
+    Output:
+      <out_basename>_rigid.pdbqt  (required)
+      <out_basename>_flex.pdbqt   (optional)
+      <out_basename>.json         (optional, if write_json=True)
+      <out_basename>.gpf          (optional, if write_gpf=True)
 
-    For rigid docking with Vina, you should pass the *_rigid.pdbqt file to --receptor.
+    Notes:
+    - For batch processing with imperfect structures, allow_bad_res=True can help.
     """
     receptor_pdb = Path(receptor_pdb).expanduser().resolve()
     out_basename = Path(out_basename).expanduser().resolve()
     _ensure_dir(out_basename.parent)
 
     cmd: List[str] = [
-        mk_prepare_receptor_exe,
+        str(mk_prepare_receptor_exe),
         "-i", str(receptor_pdb),
         "-o", str(out_basename),
     ]
 
-    # default altloc is helpful for crystal structures with alternate locations
     if default_altloc is not None:
         cmd += ["--default_altloc", str(default_altloc)]
+
+    if allow_bad_res:
+        # Meeko recommendation for batch: remove residues that cannot be templated
+        cmd += ["--allow_bad_res"]
 
     if write_json:
         cmd += ["--write_json", str(out_basename.with_suffix(".json"))]
     if write_gpf:
         cmd += ["--write_gpf", str(out_basename.with_suffix(".gpf"))]
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise MeekoError(
+            "mk_prepare_receptor.py timed out.\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"timeout_sec: {timeout_sec}\n"
+        ) from e
+    dt = time.time() - t0
 
     rigid = out_basename.parent / (out_basename.name + "_rigid.pdbqt")
     flex = out_basename.parent / (out_basename.name + "_flex.pdbqt")
     json_path = out_basename.with_suffix(".json")
     gpf_path = out_basename.with_suffix(".gpf")
 
+    stdout_tail = (proc.stdout or "")[-2000:]
+    stderr_tail = (proc.stderr or "")[-2000:]
+
+    # optional log file
+    log_path: Optional[Path] = None
+    if log_file is not None:
+        log_path = Path(log_file).expanduser().resolve()
+        _ensure_dir(log_path.parent)
+        with log_path.open("w", encoding="utf-8") as f:
+            f.write(" ".join(cmd) + "\n\n")
+            if proc.stdout:
+                f.write(proc.stdout)
+            if proc.stderr:
+                f.write("\n=== [stderr] ===\n")
+                f.write(proc.stderr)
+
     if proc.returncode != 0:
         raise MeekoError(
             "mk_prepare_receptor.py failed.\n"
             f"CMD: {' '.join(cmd)}\n"
             f"RC: {proc.returncode}\n"
-            f"STDOUT(tail): {(proc.stdout or '')[-2000:]}\n"
-            f"STDERR(tail): {(proc.stderr or '')[-2000:]}\n"
+            f"STDOUT(tail): {stdout_tail}\n"
+            f"STDERR(tail): {stderr_tail}\n"
         )
 
     if (not rigid.exists()) or rigid.stat().st_size == 0:
@@ -93,11 +135,10 @@ def prepare_receptor_pdbqt_meeko(
             "mk_prepare_receptor.py did not create rigid receptor pdbqt.\n"
             f"Expected: {rigid}\n"
             f"CMD: {' '.join(cmd)}\n"
-            f"STDOUT(tail): {(proc.stdout or '')[-2000:]}\n"
-            f"STDERR(tail): {(proc.stderr or '')[-2000:]}\n"
+            f"STDOUT(tail): {stdout_tail}\n"
+            f"STDERR(tail): {stderr_tail}\n"
         )
 
-    # flex/json/gpf are optional
     flex_pdbqt = flex if flex.exists() and flex.stat().st_size > 0 else None
     json_out = json_path if json_path.exists() and json_path.stat().st_size > 0 else None
     gpf_out = gpf_path if gpf_path.exists() and gpf_path.stat().st_size > 0 else None
@@ -107,4 +148,10 @@ def prepare_receptor_pdbqt_meeko(
         flex_pdbqt=flex_pdbqt,
         json_path=json_out,
         gpf_path=gpf_out,
+        cmd=cmd,
+        returncode=int(proc.returncode),
+        runtime_sec=float(dt),
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+        log_file=log_path,
     )
