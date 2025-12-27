@@ -211,6 +211,11 @@ class KabschFragmentEmbedder:
         the missing fragment predictions (and segment definitions) are taken from
         a fallback group (e.g. WT).
 
+    NOTE (chain filtering):
+      - Some mutant PDBs may not contain chain B (or any non-A chain fragments).
+      - You can restrict embedding to allowed scaffold chains (default: ("A",)).
+      - Fragments whose CaseRow.chain_id is not allowed are skipped (unless strict=True and you choose to enforce).
+
     Output layout (embedding stage only):
       docking_result/
         10_embed/
@@ -218,6 +223,7 @@ class KabschFragmentEmbedder:
             scaffold_original.pdb
             embedded.pdb
             transforms.json
+            embed_chain_policy.json
             fragments/
               <target_group_key>_frag1__pred_from_<case_id>.json
               <target_group_key>_frag1__pred_from_<case_id>.pdb
@@ -282,6 +288,8 @@ class KabschFragmentEmbedder:
         required_fragment_indices: Iterable[int] = (1, 2, 3),
         fallback_group_key: Optional[str] = None,
         strict: bool = True,
+        allowed_scaffold_chains: Tuple[str, ...] = ("A",),
+        verbose: bool = True,
     ) -> Path:
         """
         Embed required fragments into the TARGET scaffold.
@@ -292,8 +300,16 @@ class KabschFragmentEmbedder:
           - else error
 
         The scaffold PDB is always taken from the TARGET group (must exist at least one fragment in target).
+
+        Chain filtering:
+          - If src_case.chain_id not in allowed_scaffold_chains, that fragment will be skipped.
+          - If all required fragments are skipped and strict=True -> raise ValueError
         """
         req = list(required_fragment_indices)
+
+        allowed_set = {c.strip() for c in allowed_scaffold_chains if c and c.strip()}
+        if not allowed_set:
+            raise ValueError("allowed_scaffold_chains is empty")
 
         # Determine scaffold from any existing target fragment row
         scaffold_case: Optional[CaseRow] = None
@@ -303,7 +319,6 @@ class KabschFragmentEmbedder:
                 scaffold_case = c
                 break
         if scaffold_case is None:
-            # If the target has no entries at all, we cannot know which scaffold to use.
             msg = f"Target group has no cases in CSV: {target_group_key}"
             raise KeyError(msg)
 
@@ -313,18 +328,28 @@ class KabschFragmentEmbedder:
 
         out_dir = self.step_dir / target_group_key
         frag_dir = out_dir / "fragments"
+        out_dir.mkdir(parents=True, exist_ok=True)
         frag_dir.mkdir(parents=True, exist_ok=True)
 
         # Keep a copy of the original scaffold for traceability
         scaffold_copy = out_dir / "scaffold_original.pdb"
         if not scaffold_copy.exists():
-            out_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(scaffold_path, scaffold_copy)
+
+        if verbose:
+            print(
+                f"[Embed] target_group={target_group_key} scaffold={scaffold_path} "
+                f"fallback={fallback_group_key} allowed_scaffold_chains={sorted(list(allowed_set))} "
+                f"required_fragments={req}"
+            )
 
         raw_lines, atoms = read_pdb(scaffold_path)
 
         transforms: Dict[str, Dict[str, object]] = {}
         used_sources: Dict[int, str] = {}  # frag_idx -> case_id
+
+        skipped_fragments: List[Dict[str, object]] = []
+        embedded_fragments: List[Dict[str, object]] = []
 
         for frag_idx in req:
             src_case = self._get_case(target_group_key, frag_idx)
@@ -338,12 +363,36 @@ class KabschFragmentEmbedder:
                         f"(fallback={fallback_group_key})"
                     )
                 else:
-                    continue  # skip missing if non-strict
+                    if verbose:
+                        print(f"[Embed] SKIP frag={frag_idx} (missing in target and fallback)")
+                    skipped_fragments.append(
+                        {"frag_idx": frag_idx, "reason": "missing_in_target_and_fallback"}
+                    )
+                    continue
 
-            # Segment definition comes from the selected src_case (WT and mutants share residue numbering in your setup)
-            chain_id = src_case.chain_id
+            # Segment definition comes from the selected src_case
+            chain_id = src_case.chain_id.strip() or " "
             start_resi = src_case.start_resi
             end_resi = src_case.end_resi
+
+            # Chain filter: skip non-allowed scaffold chains (e.g., chain B)
+            if chain_id not in allowed_set:
+                if verbose:
+                    print(
+                        f"[Embed] SKIP frag={frag_idx} source={src_case.case_id} "
+                        f"(chain={chain_id} not in allowed_scaffold_chains)"
+                    )
+                skipped_fragments.append(
+                    {
+                        "frag_idx": frag_idx,
+                        "case_id": src_case.case_id,
+                        "chain_id": chain_id,
+                        "start_resi": start_resi,
+                        "end_resi": end_resi,
+                        "reason": "chain_not_allowed",
+                    }
+                )
+                continue
 
             pred_json_path = Path(src_case.pred_ca_json)
             pred_pdb_path = Path(src_case.pred_ca_pdb)
@@ -356,7 +405,6 @@ class KabschFragmentEmbedder:
             used_sources[frag_idx] = src_case.case_id
 
             if self.archive_inputs:
-                # Archive under target group folder but keep provenance in filename
                 json_dst = frag_dir / f"{target_group_key}_frag{frag_idx}__pred_from_{src_case.case_id}.json"
                 pdb_dst = frag_dir / f"{target_group_key}_frag{frag_idx}__pred_from_{src_case.case_id}.pdb"
                 shutil.copy2(pred_json_path, json_dst)
@@ -404,8 +452,55 @@ class KabschFragmentEmbedder:
                 "pred_ca_json": str(pred_json_path),
             }
 
+            embedded_fragments.append(
+                {
+                    "frag_idx": frag_idx,
+                    "case_id": src_case.case_id,
+                    "chain_id": chain_id,
+                    "start_resi": start_resi,
+                    "end_resi": end_resi,
+                }
+            )
+
+            if verbose:
+                print(
+                    f"[Embed] OK  frag={frag_idx} source={src_case.case_id} "
+                    f"segment={chain_id}:{start_resi}-{end_resi} "
+                    f"n_atoms_in_segment={len(seg_atoms)} n_ca={P.shape[0]}"
+                )
+
+        if strict and len(embedded_fragments) == 0:
+            raise ValueError(
+                f"No fragments were embedded for target={target_group_key} "
+                f"after chain filtering (allowed_scaffold_chains={sorted(list(allowed_set))})."
+            )
+
         embedded_pdb = out_dir / "embedded.pdb"
         write_pdb(embedded_pdb, raw_lines, atoms)
 
         (out_dir / "transforms.json").write_text(json.dumps(transforms, indent=2))
+
+        policy_path = out_dir / "embed_chain_policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "target_group_key": target_group_key,
+                    "scaffold_pdb": str(scaffold_path),
+                    "fallback_group_key": fallback_group_key,
+                    "required_fragment_indices": req,
+                    "allowed_scaffold_chains": sorted(list(allowed_set)),
+                    "embedded_fragments": embedded_fragments,
+                    "skipped_fragments": skipped_fragments,
+                },
+                indent=2,
+            )
+        )
+
+        if verbose:
+            print(
+                f"[Embed] DONE target_group={target_group_key} "
+                f"embedded={len(embedded_fragments)} skipped={len(skipped_fragments)} "
+                f"out={embedded_pdb}"
+            )
+
         return embedded_pdb
