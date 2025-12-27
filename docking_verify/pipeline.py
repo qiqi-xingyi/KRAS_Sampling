@@ -241,7 +241,10 @@ class DockingPipeline:
             target_group_key=target_group_key,
             fallback_group_key=fallback,
             strict=True,
+            allowed_scaffold_chains=("A",),
+            verbose=True,
         )
+
         self._log(f"  embedded_pdb: {embedded_pdb}")
 
         # 2) Prepare PDBQT
