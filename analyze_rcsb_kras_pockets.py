@@ -313,7 +313,7 @@ def main() -> None:
     ap.add_argument("--pdb_dir", type=str, default="RCSB_KRAS", help="Folder containing PDB files (default: RCSB_KRAS)")
     ap.add_argument("--cases_csv", type=str, default="docking_data/cases.csv",
                     help="Optional cases.csv to provide ligand_resname mapping (default: docking_data/cases.csv)")
-    ap.add_argument("--radius", type=float, default=6.0, help="Radius in Angstrom (default: 6.0)")
+    ap.add_argument("--radius", type=float, default=10.0, help="Radius in Angstrom (default: 6.0)")
 
     ap.add_argument("--include_hetatm_in_receptor", action="store_true", help="Include HETATM in receptor selection")
     ap.add_argument("--het_whitelist", type=str, default="", help="Comma-separated HETATM resnames to include (optional)")
