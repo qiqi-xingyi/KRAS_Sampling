@@ -18,7 +18,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 # PDB utilities (lightweight)
 # -----------------------------
 _WATER_RESNAMES = {"HOH", "WAT", "H2O", "DOD"}
-# Common non-protein residues you likely do NOT want in receptor by default
 _DEFAULT_SKIP_HETERO = _WATER_RESNAMES
 
 
@@ -41,7 +40,6 @@ def _record_name(line: str) -> str:
 
 
 def _altloc(line: str) -> str:
-    # Column 17 (0-based 16)
     return line[16].strip() if len(line) > 16 else ""
 
 
@@ -66,7 +64,6 @@ def _icode(line: str) -> str:
 
 
 def _occupancy(line: str) -> float:
-    # Columns 55-60 (0-based 54:60)
     try:
         return float(line[54:60].strip())
     except Exception:
@@ -84,17 +81,13 @@ def _ensure_trailing_newline(lines: List[str]) -> List[str]:
 def _filter_altloc_keep_best(lines: Sequence[str]) -> List[str]:
     """
     Resolve alternate locations by keeping the best-occupancy altloc for each atom identity.
-
-    Atom identity key:
-      (record, chain, resseq, icode, resname, atom_name)
-
+    Atom identity key: (record, chain, resseq, icode, resname, atom_name)
     If occupancy ties, prefer altloc=' ' then 'A' then others.
     """
     best: Dict[Tuple[str, str, int, str, str, str], Tuple[float, int, str]] = {}
     chosen_line: Dict[Tuple[str, str, int, str, str, str], str] = {}
 
     def pref_rank(a: str) -> int:
-        # lower is better
         if a == "":
             a = " "
         if a == " ":
@@ -166,20 +159,6 @@ def _group_ligand_residues(atom_lines: Sequence[str], ligand_resname: str) -> Di
     return groups
 
 
-def _pdbqt_has_root_tags(pdbqt_path: Path) -> bool:
-    """
-    Vina rigid receptor must NOT contain ROOT/BRANCH/TORSDOF tags.
-    This helper checks for those tags (ROOT is the most common).
-    """
-    if not pdbqt_path.exists() or pdbqt_path.stat().st_size == 0:
-        return False
-    for ln in pdbqt_path.read_text(errors="replace").splitlines():
-        t = ln.strip().split()[0] if ln.strip() else ""
-        if t in {"ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF"}:
-            return True
-    return False
-
-
 # -----------------------------
 # OpenBabel runner
 # -----------------------------
@@ -212,6 +191,7 @@ class PDBQTPreparer:
     """
     Component:
       - Split an embedded complex PDB into receptor and ligand
+      - Receptor is restricted to specified chain(s) (default: chain A only)
       - Convert both to PDBQT via OpenBabel (obabel)
       - Save outputs under docking_result/<step>/<group_key>/...
 
@@ -226,6 +206,7 @@ class PDBQTPreparer:
         archive_inputs: bool = True,
         receptor_include_hetatm: bool = False,
         receptor_het_whitelist: Optional[Iterable[str]] = None,
+        receptor_chain_whitelist: Optional[Iterable[str]] = ("A",),
     ) -> None:
         self.result_root = Path(result_root)
         self.step_dir = self.result_root / step_dirname
@@ -233,6 +214,10 @@ class PDBQTPreparer:
         self.archive_inputs = bool(archive_inputs)
         self.receptor_include_hetatm = bool(receptor_include_hetatm)
         self.receptor_het_whitelist = set(receptor_het_whitelist or [])
+        self.receptor_chain_whitelist = set([c.strip() for c in (receptor_chain_whitelist or []) if c.strip()])
+
+        if not self.receptor_chain_whitelist:
+            raise ValueError("receptor_chain_whitelist must not be empty.")
 
     def prepare(
         self,
@@ -250,7 +235,7 @@ class PDBQTPreparer:
           embedded_pdb: path to embedded complex PDB (protein + ligand)
           ligand_resname: resname to extract as ligand (e.g., GDP, MOV)
           ligand_residue_id: if multiple ligands share same resname, specify which one (chain, resseq, icode)
-          keep_others_pdb: whether to save a debugging PDB for non-selected HETATM
+          keep_others_pdb: whether to save a debugging PDB for excluded atoms (other chains, non-selected HETATM, etc.)
           ph: if provided, use OpenBabel -p <ph> (typically for ligand hydrogenation)
 
         Returns:
@@ -272,7 +257,6 @@ class PDBQTPreparer:
         if self.archive_inputs:
             shutil.copy2(embedded_pdb, input_dir / "embedded.pdb")
 
-        # ---- Load + altloc resolve (only atom records) ----
         raw_lines = embedded_pdb.read_text().splitlines(keepends=True)
         atom_lines = [ln for ln in raw_lines if _is_atom_record(ln)]
         atom_lines = _filter_altloc_keep_best(atom_lines)
@@ -281,15 +265,19 @@ class PDBQTPreparer:
         receptor_lines: List[str] = []
         others_lines: List[str] = []
 
-        # Receptor selection:
-        # - default: only ATOM lines
-        # - optionally include certain HETATM by whitelist (e.g. metal cofactors)
         for ln in atom_lines:
             rec = _record_name(ln)
             rn = _resname(ln)
+            ch = _chain_id(ln)
+
+            # Chain filter for receptor selection
+            in_receptor_chain = ch in self.receptor_chain_whitelist
 
             if rec == "ATOM":
-                receptor_lines.append(ln)
+                if in_receptor_chain:
+                    receptor_lines.append(ln)
+                else:
+                    others_lines.append(ln)
                 continue
 
             # HETATM
@@ -297,14 +285,13 @@ class PDBQTPreparer:
                 others_lines.append(ln)
                 continue
 
-            if self.receptor_include_hetatm and (rn in self.receptor_het_whitelist):
+            if in_receptor_chain and self.receptor_include_hetatm and (rn in self.receptor_het_whitelist):
                 receptor_lines.append(ln)
             else:
                 others_lines.append(ln)
 
-        # Ligand selection:
+        # Ligand selection (search all atom_lines, independent of receptor chain filter)
         ligand_groups = _group_ligand_residues(atom_lines, ligand_resname=ligand_resname)
-
         if not ligand_groups:
             raise ValueError(
                 f"No ligand HETATM with resname={ligand_resname} found in {embedded_pdb}"
@@ -320,7 +307,6 @@ class PDBQTPreparer:
                 )
             ligand_key = key
         else:
-            # pick the residue instance with the most atoms (robust default)
             ligand_key = max(ligand_groups.keys(), key=lambda k: len(ligand_groups[k]))
 
         ligand_lines = ligand_groups[ligand_key]
@@ -350,6 +336,7 @@ class PDBQTPreparer:
                 "others_atom_lines": len(others_lines),
                 "ligand_instances_found": len(ligand_groups),
             },
+            "receptor_chain_whitelist": sorted(list(self.receptor_chain_whitelist)),
             "receptor_include_hetatm": self.receptor_include_hetatm,
             "receptor_het_whitelist": sorted(list(self.receptor_het_whitelist)),
         }
@@ -359,42 +346,31 @@ class PDBQTPreparer:
         receptor_pdbqt = pdbqt_dir / "receptor.pdbqt"
         ligand_pdbqt = pdbqt_dir / "ligand.pdbqt"
 
-        cmd_records: List[CommandResult] = []
-
-        # IMPORTANT:
-        # - receptor: rigid output to avoid ROOT/BRANCH tags -> add -xr -xc
-        # - ligand: keep flexible (NO -xr) so Vina can sample torsions
+        # Receptor: rigid + charges; add -xr -xc to avoid ROOT / torsion tree
         receptor_cmd = [
             self.obabel_bin,
-            "-ipdb",
-            str(receptor_pdb),
+            "-ipdb", str(receptor_pdb),
             "-opdbqt",
-            "-O",
-            str(receptor_pdbqt),
+            "-O", str(receptor_pdbqt),
             "-h",
-            "-xr",
-            "-xc",
+            "-xr", "-xc",
         ]
 
+        # Ligand: keep flexible (no -xr), add hydrogens + gasteiger charges
         ligand_cmd = [
             self.obabel_bin,
-            "-ipdb",
-            str(ligand_pdb),
+            "-ipdb", str(ligand_pdb),
             "-opdbqt",
-            "-O",
-            str(ligand_pdbqt),
+            "-O", str(ligand_pdbqt),
             "-h",
-            "--partialcharge",
-            "gasteiger",
+            "--partialcharge", "gasteiger",
         ]
         if ph is not None:
             ligand_cmd.extend(["-p", str(ph)])
 
         r_res = _run_cmd("obabel_receptor", receptor_cmd)
         l_res = _run_cmd("obabel_ligand", ligand_cmd)
-        cmd_records.extend([r_res, l_res])
 
-        # Save logs
         (logs_dir / "obabel_receptor.stdout.txt").write_text(r_res.stdout)
         (logs_dir / "obabel_receptor.stderr.txt").write_text(r_res.stderr)
         (logs_dir / "obabel_ligand.stdout.txt").write_text(l_res.stdout)
@@ -408,7 +384,6 @@ class PDBQTPreparer:
         }
         (logs_dir / "commands.json").write_text(json.dumps(commands_json, indent=2))
 
-        # Basic validation
         if r_res.returncode != 0 or not receptor_pdbqt.exists() or receptor_pdbqt.stat().st_size == 0:
             raise RuntimeError(
                 f"OpenBabel receptor conversion failed (returncode={r_res.returncode}). "
@@ -418,13 +393,6 @@ class PDBQTPreparer:
             raise RuntimeError(
                 f"OpenBabel ligand conversion failed (returncode={l_res.returncode}). "
                 f"See logs in {logs_dir}"
-            )
-
-        # Hard check: receptor PDBQT must not contain ROOT/BRANCH/TORSDOF tags for Vina rigid receptor
-        if _pdbqt_has_root_tags(receptor_pdbqt):
-            raise RuntimeError(
-                "Receptor PDBQT still contains ROOT/BRANCH/TORSDOF tags after applying -xr -xc. "
-                f"Vina will reject it. Please inspect: {receptor_pdbqt}"
             )
 
         out: Dict[str, Path] = {
