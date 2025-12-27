@@ -91,7 +91,6 @@ def _filter_altloc_keep_best(lines: Sequence[str]) -> List[str]:
     If occupancy ties, prefer altloc=' ' then 'A' then others.
     """
     best: Dict[Tuple[str, str, int, str, str, str], Tuple[float, int, str]] = {}
-    # store (occupancy, preference_rank, chosen_line)
     chosen_line: Dict[Tuple[str, str, int, str, str, str], str] = {}
 
     def pref_rank(a: str) -> int:
@@ -123,12 +122,10 @@ def _filter_altloc_keep_best(lines: Sequence[str]) -> List[str]:
             chosen_line[key] = ln
         else:
             prev = best[key]
-            # compare occupancy first, then rank
             if (cand[0] > prev[0]) or (cand[0] == prev[0] and cand[1] < prev[1]):
                 best[key] = cand
                 chosen_line[key] = ln
 
-    # Preserve original order; only emit if it matches chosen_line for its key
     out: List[str] = []
     for ln in lines:
         if not _is_atom_record(ln):
@@ -142,8 +139,6 @@ def _filter_altloc_keep_best(lines: Sequence[str]) -> List[str]:
             _atom_name(ln),
         )
         if chosen_line.get(key) == ln:
-            # Normalize altLoc column to blank for cleanliness (optional but helpful)
-            # We avoid heavy rewriting; just keep as-is.
             out.append(ln)
     return _ensure_trailing_newline(out)
 
@@ -169,6 +164,20 @@ def _group_ligand_residues(atom_lines: Sequence[str], ligand_resname: str) -> Di
         rid = _residue_id(ln).key()
         groups.setdefault(rid, []).append(ln)
     return groups
+
+
+def _pdbqt_has_root_tags(pdbqt_path: Path) -> bool:
+    """
+    Vina rigid receptor must NOT contain ROOT/BRANCH/TORSDOF tags.
+    This helper checks for those tags (ROOT is the most common).
+    """
+    if not pdbqt_path.exists() or pdbqt_path.stat().st_size == 0:
+        return False
+    for ln in pdbqt_path.read_text(errors="replace").splitlines():
+        t = ln.strip().split()[0] if ln.strip() else ""
+        if t in {"ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF"}:
+            return True
+    return False
 
 
 # -----------------------------
@@ -352,7 +361,9 @@ class PDBQTPreparer:
 
         cmd_records: List[CommandResult] = []
 
-        # Receptor: keep it simple; OpenBabel protein typing varies, but works for Vina in many cases.
+        # IMPORTANT:
+        # - receptor: rigid output to avoid ROOT/BRANCH tags -> add -xr -xc
+        # - ligand: keep flexible (NO -xr) so Vina can sample torsions
         receptor_cmd = [
             self.obabel_bin,
             "-ipdb",
@@ -361,8 +372,10 @@ class PDBQTPreparer:
             "-O",
             str(receptor_pdbqt),
             "-h",
+            "-xr",
+            "-xc",
         ]
-        # ligand: add hydrogens + gasteiger charges
+
         ligand_cmd = [
             self.obabel_bin,
             "-ipdb",
@@ -375,7 +388,6 @@ class PDBQTPreparer:
             "gasteiger",
         ]
         if ph is not None:
-            # Apply pH adjustment mainly meaningful for ligand hydrogenation
             ligand_cmd.extend(["-p", str(ph)])
 
         r_res = _run_cmd("obabel_receptor", receptor_cmd)
@@ -406,6 +418,13 @@ class PDBQTPreparer:
             raise RuntimeError(
                 f"OpenBabel ligand conversion failed (returncode={l_res.returncode}). "
                 f"See logs in {logs_dir}"
+            )
+
+        # Hard check: receptor PDBQT must not contain ROOT/BRANCH/TORSDOF tags for Vina rigid receptor
+        if _pdbqt_has_root_tags(receptor_pdbqt):
+            raise RuntimeError(
+                "Receptor PDBQT still contains ROOT/BRANCH/TORSDOF tags after applying -xr -xc. "
+                f"Vina will reject it. Please inspect: {receptor_pdbqt}"
             )
 
         out: Dict[str, Path] = {
