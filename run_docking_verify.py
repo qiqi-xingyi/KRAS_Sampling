@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--exhaustiveness", type=int, default=16)
     p.add_argument("--num_modes", type=int, default=20)
     p.add_argument("--energy_range", type=int, default=3)
-    p.add_argument("--cpu", type=int, default=8)
+    p.add_argument("--cpu", type=int, default=4)
 
     # Repeats / seeds
     p.add_argument("--n_repeats", type=int, default=5, help="Number of repeated dockings per group (if no seed_list)")
