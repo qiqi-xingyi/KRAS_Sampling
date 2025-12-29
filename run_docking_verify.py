@@ -105,6 +105,7 @@ def main() -> None:
 
     pipeline = DockingPipeline(cfg)
 
+
     if TARGET_GROUPS is None:
         results = pipeline.run_all()
     else:
