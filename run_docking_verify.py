@@ -4,7 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:run_docking_verify.py
 
-
 """
 IDE-friendly runner for docking_verify.
 
