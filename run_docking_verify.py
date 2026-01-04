@@ -47,6 +47,7 @@ VINA_BIN = "vina"
 # Example:
 # VINA_BIN = "/opt/anaconda3/envs/docking/bin/vina"
 
+
 OBABEL_BIN = "obabel"
 
 # Vina parameters
