@@ -24,10 +24,6 @@ from pathlib import Path
 from docking_verify import DockingPipeline, PipelineConfig, BoxConfig, VinaParams
 
 
-# =============================
-# User-editable configuration
-# =============================
-
 # Project root directory (set this to your repo root)
 # If None, uses current working directory.
 WORKDIR: str | None = None
