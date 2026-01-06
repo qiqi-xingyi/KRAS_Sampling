@@ -15,7 +15,7 @@ import pandas as pd
 # =========================
 INFO_FILE = Path("dataset/QDockbank_info.txt")
 USED_FILE = Path("dataset/tasks_used.csv")
-OUT_FILE = Path("dataset/tasks2.csv")
+OUT_FILE = Path("tasks2.csv")
 
 # If True: remove a QDockbank row when either pdbid OR sequence has been used
 STRICT_REMOVE_BY_PDBID_OR_SEQ = True
