@@ -22,7 +22,7 @@ from Protein_Folding.penalty_parameters import PenaltyParameters
 from Protein_Folding.protein_folding_problem import ProteinFoldingProblem
 
 
-TASKS_FILE = "./tasks.csv"
+TASKS_FILE = "./tasks2.csv"
 
 # Penalty parameters for protein folding Hamiltonian
 PENALTY_PARAMS: Tuple[int, int, int] = (10, 10, 10)
@@ -36,7 +36,7 @@ GROUP_COUNT = 10
 SHOTS_PER_GROUP = 2000
 
 # Use a KRAS-specific root directory for outputs
-OUTPUT_ROOT = Path("KRAS_sampling_results")
+OUTPUT_ROOT = Path("QDock_sampling_results")
 
 # If you want to fix a backend, put its name here; otherwise set to None
 IBM_BACKEND_NAME: str | None = "ibm_cleveland"  # or None to let SamplingRunner decide
