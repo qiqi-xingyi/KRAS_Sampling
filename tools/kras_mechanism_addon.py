@@ -177,8 +177,14 @@ def find_delta_table() -> Optional[Path]:
     candidates = [
         ANALYSIS_DIR / "basin_delta_summary.csv",
         ANALYSIS_DIR / "addon" / "basin_delta_summary.csv",
+        ANALYSIS_DIR / "addons" / "basin_delta_summary.csv",
+
         ANALYSIS_DIR / "basin_delta.csv",
+        ANALYSIS_DIR / "addons" / "basin_delta.csv",
+
+        ANALYSIS_DIR / "addons" / "basin_energy_contrast.csv",
     ]
+
     for p in candidates:
         if p.exists():
             return p
