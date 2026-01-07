@@ -4,9 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:kras_mechanism_addon.py
 
-# --*-- coding:utf-8 --*--
-# tools/kras_addons_only.py
-#
 # Add-on only (NO re-run of embedding/basin pipeline):
 # 1) Per-residue displacement curves (from exported CA-only PDBs)
 # 2) Energy-term waterfall plots (from basin_energy_contrast.csv)
