@@ -35,12 +35,18 @@ import matplotlib.pyplot as plt
 # ----------------------------
 # Config (edit here)
 # ----------------------------
-PROJECT_ROOT = Path(" ").resolve()
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 ANALYSIS_DIR = PROJECT_ROOT / "KRAS_sampling_results" / "analysis_closed_loop"
 ADDONS_DIR = ANALYSIS_DIR / "addons"
 EXPORTED_PDB_DIR = ADDONS_DIR / "exported_pdb"
 ENERGY_CONTRAST_CSV = ADDONS_DIR / "basin_energy_contrast.csv"
+
+print("[INFO] PROJECT_ROOT:", PROJECT_ROOT)
+print("[INFO] ANALYSIS_DIR:", ANALYSIS_DIR)
+
 
 # if None -> auto-detect basins from exported_pdb + energy file intersection
 BASINS_TO_PLOT: Optional[List[int]] = None  # e.g., [1, 2, 5, 6]
