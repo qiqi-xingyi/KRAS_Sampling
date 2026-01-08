@@ -385,6 +385,7 @@ def per_example_sampling(task_label: str, pdbid: str, sequence: str) -> str:
     progress["updated_at"] = utc_now_iso()
     save_json_atomic(progress_path, progress)
 
+
     if not any_ran:
         print(f"[Info] {task_label}: no new groups ran in this execution (resume skip only).")
 
