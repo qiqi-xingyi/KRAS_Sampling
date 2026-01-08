@@ -28,8 +28,8 @@ from qsadpp.orchestrator import OrchestratorConfig, PipelineOrchestrator
 from qsadpp.io_reader import ReaderOptions
 from qsadpp.feature_calculator import FeatureConfig
 
-BASE_DIR = Path("./KRAS_sampling_results")
-OUT_ROOT = Path("./pp_result")
+BASE_DIR = Path("./QDock_sampling_results")
+OUT_ROOT = Path("./Q_Dock_pp_result")
 STAGING_ROOT = OUT_ROOT / "_staging"
 
 INCLUDE_PATTERNS = [
