@@ -4,45 +4,47 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
-# --*-- coding:utf-8 --*--
-# @time:12/19/25
-# @Author : Yuqi Zhang
-# @File: tools/Plt_group_rmsd.py
 # ------------------------------------------------------------
-# Compare RMSD among four methods on the sampling-available set:
-#   - Sampling-based (from backbone_rmsd_min.csv)
-#   - AF2 (ColabFold) (from af2_rmsd_summary.txt)
-#   - AF3 (AlphaFold3) (from af3_rmsd_summary.txt)
-#   - VQE (from q_rmsd_summary.txt)
-#
-# Rule:
-#   ONLY plot pdb_ids that exist in sampling results.
-#   If other methods miss a pdb_id, skip those points.
-#
-# Plot request:
-#   - 1 bar chart (mean RMSD per method) with correlation-color encoding
-#   - 3 scatter plots (sampling vs AF2/AF3/VQE) with correlation-color encoding
+# QDock RMSD comparison plots (on sampling-available cases):
+#   1) Grouped bar chart: per-case RMSD for ALL cases (sampling has)
+#      - x axis: pdb_id (sorted by sampling RMSD)
+#      - bars per case: Sampling / AF2 / AF3 / VQE (missing -> skip that bar)
+#   2) Boxplot: RMSD distribution comparison across methods
 #
 # Inputs:
 #   <project_root>/QDock_RMSD/
 #     af2_rmsd_summary.txt
 #     af3_rmsd_summary.txt
 #     q_rmsd_summary.txt
-#     backbone_rmsd_min.csv
+#     backbone_rmsd_min.csv   (sampling-based min RMSD per pdb_id)
 #
 # Outputs:
 #   <project_root>/QDock_RMSD/merged_rmsd_on_sampling_ids.csv
-#   <project_root>/QDock_RMSD/plots_compare/*.png/pdf
+#   <project_root>/QDock_RMSD/plots_compare/
+#     grouped_bar_all_cases.png/.pdf
+#     boxplot_methods.png/.pdf
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# User parameters
+# -----------------------------
+SORT_BY = "sampling_rmsd"   # "sampling_rmsd" or "pdb_id"
+MAX_CASES = None           # None means plot all. You can set e.g. 120 for debugging.
+
+# Style tweaks
+BAR_WIDTH = 0.20
+ROTATE_X = 90
+DPI = 300
 
 
 # -----------------------------
@@ -58,7 +60,7 @@ def project_root_from_tools_dir() -> Path:
 def read_rmsd_kv_txt(path: Path) -> Dict[str, float]:
     """
     Parse lines like:
-      pdb_id <tab or spaces> rmsd
+      pdb_id <tab/spaces> rmsd
     Ignore empty lines and comment lines starting with '#'.
     """
     if not path.exists():
@@ -94,31 +96,9 @@ def safe_float(x) -> Optional[float]:
         return None
 
 
-# -----------------------------
-# Correlation + color mapping
-# -----------------------------
-def pearson_r(x: np.ndarray, y: np.ndarray) -> float:
-    if len(x) < 2:
-        return float("nan")
-    if np.std(x) < 1e-12 or np.std(y) < 1e-12:
-        return float("nan")
-    return float(np.corrcoef(x, y)[0, 1])
-
-
-def corr_to_color(r: float, cmap=plt.cm.coolwarm):
-    """
-    Map r in [-1, 1] to a RGBA color. If r is nan, return gray.
-    """
-    if r is None or (isinstance(r, float) and np.isnan(r)):
-        return (0.55, 0.55, 0.55, 1.0)
-    r = max(-1.0, min(1.0, float(r)))
-    t = (r + 1.0) / 2.0
-    return cmap(t)
-
-
 def save_fig(fig: plt.Figure, out_png: Path, out_pdf: Path):
     fig.tight_layout()
-    fig.savefig(out_png, dpi=300)
+    fig.savefig(out_png, dpi=DPI)
     fig.savefig(out_pdf)
     plt.close(fig)
 
@@ -126,132 +106,116 @@ def save_fig(fig: plt.Figure, out_png: Path, out_pdf: Path):
 # -----------------------------
 # Plotting
 # -----------------------------
-def plot_bar_means_with_corr_colors(
+def plot_grouped_bar_all_cases(
     df: pd.DataFrame,
     out_png: Path,
     out_pdf: Path,
 ):
     """
-    Bar chart: mean RMSD per method (on sampling-id set).
-    Colors for AF2/AF3/VQE are based on Pearson correlation with sampling (paired subset).
+    Grouped bar chart per pdb_id for all sampling-available cases.
+    Missing values in other methods are skipped (no bar drawn for that method/case).
     """
-    methods = [
+    methods: List[Tuple[str, str]] = [
         ("sampling_rmsd", "Sampling"),
         ("af2_rmsd", "AF2 (ColabFold)"),
         ("af3_rmsd", "AF3"),
         ("vqe_rmsd", "VQE"),
     ]
 
-    means = []
-    sems = []
-    ns = []
-    colors = []
+    # fixed colors for readability (no seaborn)
+    colors = {
+        "sampling_rmsd": (0.45, 0.45, 0.45, 1.0),  # gray
+        "af2_rmsd": (0.20, 0.40, 0.80, 1.0),       # blue-ish
+        "af3_rmsd": (0.20, 0.70, 0.35, 1.0),       # green-ish
+        "vqe_rmsd": (0.85, 0.35, 0.20, 1.0),       # red-ish
+    }
 
-    sampling_color = (0.45, 0.45, 0.45, 1.0)
+    d = df.copy()
 
-    for col, _ in methods:
-        vals = df[col].dropna().to_numpy(float)
-        n = len(vals)
-        ns.append(n)
+    # sort
+    if SORT_BY == "pdb_id":
+        d = d.sort_values("pdb_id").reset_index(drop=True)
+    else:
+        d = d.sort_values("sampling_rmsd").reset_index(drop=True)
 
-        if n == 0:
-            means.append(np.nan)
-            sems.append(np.nan)
-        else:
-            means.append(float(np.mean(vals)))
-            sems.append(float(np.std(vals, ddof=1) / np.sqrt(n)) if n > 1 else 0.0)
+    if MAX_CASES is not None:
+        d = d.iloc[: int(MAX_CASES)].reset_index(drop=True)
 
-        if col == "sampling_rmsd":
-            colors.append(sampling_color)
-        else:
-            paired = df[["sampling_rmsd", col]].dropna()
-            r = pearson_r(
-                paired["sampling_rmsd"].to_numpy(float),
-                paired[col].to_numpy(float),
-            ) if not paired.empty else float("nan")
-            colors.append(corr_to_color(r))
+    n = len(d)
+    x = np.arange(n, dtype=float)
 
-    x = np.arange(len(methods), dtype=int)
+    # dynamic figure width: ensure labels are readable
+    fig_w = max(12.0, 0.35 * n)  # increase with #cases
+    fig_h = 6.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-    fig, ax = plt.subplots(figsize=(8.2, 5.3))
-    bars = ax.bar(x, means, yerr=sems, capsize=4, color=colors)
+    offsets = np.linspace(-1.5 * BAR_WIDTH, 1.5 * BAR_WIDTH, num=len(methods))
+
+    for (col, label), off in zip(methods, offsets):
+        y = pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float)
+        mask = ~np.isnan(y)
+        if np.any(mask):
+            ax.bar(
+                x[mask] + off,
+                y[mask],
+                width=BAR_WIDTH,
+                label=f"{label} (n={int(mask.sum())})",
+                color=colors.get(col, None),
+            )
 
     ax.set_xticks(x)
-    ax.set_xticklabels([m[1] for m in methods])
+    ax.set_xticklabels(d["pdb_id"].tolist(), rotation=ROTATE_X, ha="center")
     ax.set_ylabel("RMSD (Å)")
-    ax.set_title(
-        "Mean RMSD on sampling-available cases\n"
-        "AF2/AF3/VQE bar color encodes Pearson r vs Sampling"
-    )
+    ax.set_title("Per-case RMSD comparison (only cases with Sampling results)")
+    ax.legend(frameon=False, ncol=2)
 
-    # annotate n on top of each bar
-    for i, b in enumerate(bars):
-        h = b.get_height()
-        if np.isnan(h):
-            continue
-        ax.text(
-            b.get_x() + b.get_width() / 2,
-            h,
-            f"n={ns[i]}",
-            ha="center",
-            va="bottom",
-            fontsize=10,
-        )
-
-    # colorbar (explicitly bind to ax)
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.coolwarm, norm=plt.Normalize(vmin=-1, vmax=1))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label("Pearson r vs Sampling")
+    # y limit a bit padded
+    y_all = []
+    for col, _ in methods:
+        y = pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float)
+        y = y[~np.isnan(y)]
+        if len(y) > 0:
+            y_all.append(y)
+    if y_all:
+        ymax = float(np.max(np.concatenate(y_all)))
+        ax.set_ylim(0.0, ymax * 1.10)
 
     save_fig(fig, out_png, out_pdf)
 
 
-def plot_scatter_corrcolored(
+def plot_boxplot_methods(
     df: pd.DataFrame,
-    y_col: str,
-    y_label: str,
     out_png: Path,
     out_pdf: Path,
 ):
     """
-    Scatter: Sampling vs (method).
-    Point color is a single color determined by Pearson r for that paired subset.
+    Boxplot comparing RMSD distributions across methods
+    (still on the sampling-id set; each method uses its available subset).
     """
-    sub = df[["sampling_rmsd", y_col]].dropna()
-    if sub.empty:
-        print(f"[SKIP] scatter sampling vs {y_col}: no overlap")
+    methods: List[Tuple[str, str]] = [
+        ("sampling_rmsd", "Sampling"),
+        ("af2_rmsd", "AF2 (ColabFold)"),
+        ("af3_rmsd", "AF3"),
+        ("vqe_rmsd", "VQE"),
+    ]
+
+    data = []
+    labels = []
+    for col, name in methods:
+        vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
+        if len(vals) == 0:
+            continue
+        data.append(vals)
+        labels.append(f"{name}\n(n={len(vals)})")
+
+    if not data:
+        print("[SKIP] boxplot: no data")
         return
 
-    x = sub["sampling_rmsd"].to_numpy(float)
-    y = sub[y_col].to_numpy(float)
-    r = pearson_r(x, y)
-    color = corr_to_color(r)
-
-    lo = float(min(x.min(), y.min()))
-    hi = float(max(x.max(), y.max()))
-    pad = 0.05 * (hi - lo + 1e-12)
-    lo -= pad
-    hi += pad
-
-    fig, ax = plt.subplots(figsize=(6.6, 6.0))
-    ax.scatter(x, y, s=20, alpha=0.75, color=color, edgecolors="none")
-    ax.plot([lo, hi], [lo, hi], linewidth=1.4, color=(0.3, 0.3, 0.3, 1.0))
-
-    ax.set_xlim(lo, hi)
-    ax.set_ylim(lo, hi)
-    ax.set_xlabel("Sampling RMSD (Å)")
-    ax.set_ylabel(f"{y_label} RMSD (Å)")
-
-    title_r = "nan" if np.isnan(r) else f"{r:.3f}"
-    ax.set_title(f"Sampling vs {y_label}   r={title_r}   n={len(sub)}")
-
-    # colorbar (explicitly bind to ax)
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.coolwarm, norm=plt.Normalize(vmin=-1, vmax=1))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label("Pearson r (color meaning)")
-
+    fig, ax = plt.subplots(figsize=(7.8, 5.6))
+    ax.boxplot(data, labels=labels, showfliers=True)
+    ax.set_ylabel("RMSD (Å)")
+    ax.set_title("RMSD distribution comparison (sampling-available cases)")
     save_fig(fig, out_png, out_pdf)
 
 
@@ -279,6 +243,7 @@ def main():
 
     s_df["pdb_id"] = s_df["pdb_id"].astype(str).str.strip().str.lower()
     s_df["sampling_rmsd"] = pd.to_numeric(s_df["min_rmsd"], errors="coerce")
+    s_df = s_df.dropna(subset=["sampling_rmsd"]).reset_index(drop=True)
 
     sampling_ids = sorted(set(s_df["pdb_id"].tolist()))
     print(f"[LOAD] sampling cases: {len(sampling_ids)}")
@@ -292,7 +257,7 @@ def main():
     # Merge only on sampling ids
     rows = []
     for pid in sampling_ids:
-        # if duplicates exist in sampling_csv, take the first
+        # if duplicates exist, take the first sampling row
         srows = s_df.loc[s_df["pdb_id"] == pid, "sampling_rmsd"]
         s_val = safe_float(srows.iloc[0]) if len(srows) > 0 else None
 
@@ -313,41 +278,25 @@ def main():
     df.to_csv(merged_out, index=False)
     print(f"[SAVE] merged table: {merged_out} (n={len(df)})")
 
-    # Output plots
+    # Output dir
     out_dir = rmsd_dir / "plots_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1 bar
-    plot_bar_means_with_corr_colors(
+    # 1) Grouped bar (all cases)
+    plot_grouped_bar_all_cases(
         df,
-        out_png=out_dir / "bar_mean_rmsd_corrcolor.png",
-        out_pdf=out_dir / "bar_mean_rmsd_corrcolor.pdf",
+        out_png=out_dir / "grouped_bar_all_cases.png",
+        out_pdf=out_dir / "grouped_bar_all_cases.pdf",
     )
 
-    # 3 scatters
-    plot_scatter_corrcolored(
+    # 2) Boxplot
+    plot_boxplot_methods(
         df,
-        y_col="af2_rmsd",
-        y_label="AF2 (ColabFold)",
-        out_png=out_dir / "scatter_sampling_vs_af2_corrcolor.png",
-        out_pdf=out_dir / "scatter_sampling_vs_af2_corrcolor.pdf",
-    )
-    plot_scatter_corrcolored(
-        df,
-        y_col="af3_rmsd",
-        y_label="AF3",
-        out_png=out_dir / "scatter_sampling_vs_af3_corrcolor.png",
-        out_pdf=out_dir / "scatter_sampling_vs_af3_corrcolor.pdf",
-    )
-    plot_scatter_corrcolored(
-        df,
-        y_col="vqe_rmsd",
-        y_label="VQE",
-        out_png=out_dir / "scatter_sampling_vs_vqe_corrcolor.png",
-        out_pdf=out_dir / "scatter_sampling_vs_vqe_corrcolor.pdf",
+        out_png=out_dir / "boxplot_methods.png",
+        out_pdf=out_dir / "boxplot_methods.pdf",
     )
 
-    # quick overlap stats
+    # Quick overlap stats
     print("\n[OVERLAP on sampling set]")
     print(f"  Sampling n = {len(df)}")
     print(f"  AF2 overlap = {int(df['af2_rmsd'].notna().sum())}")
