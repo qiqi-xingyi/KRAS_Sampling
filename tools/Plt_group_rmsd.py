@@ -4,12 +4,17 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
+
 # ------------------------------------------------------------
 # QDock RMSD comparison plots (on sampling-available cases):
-#   1) Grouped bar chart: per-case RMSD for ALL cases (sampling has)
-#      - x axis: pdb_id (sorted by sampling RMSD)
-#      - bars per case: Sampling / AF2 / AF3 / VQE (missing -> skip that bar)
+#   1) Grouped bar chart: per-case RMSD for ALL cases (Sampling defines the case set)
 #   2) Boxplot: RMSD distribution comparison across methods
+#
+# Key requirements:
+#   - Same method uses the SAME color in both plots
+#   - Provide easy interfaces at the top to change:
+#       (a) colors
+#       (b) font sizes
 #
 # Inputs:
 #   <project_root>/QDock_RMSD/
@@ -35,28 +40,63 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# -----------------------------
-# User parameters
-# -----------------------------
-SORT_BY = "sampling_rmsd"   # "sampling_rmsd" or "pdb_id"
-MAX_CASES = None           # None means plot all. You can set e.g. 120 for debugging.
+# ============================================================
+# USER INTERFACES (EDIT HERE)
+# ============================================================
 
-# Style tweaks
-BAR_WIDTH = 0.20
-ROTATE_X = 90
+# 1) Method colors (keep consistent across all plots)
+METHOD_STYLES = {
+    # key must match columns in merged df
+    "sampling_rmsd": {"label": "Our",        "color": "#6E6E6E"},  # gray
+    "af2_rmsd":      {"label": "ColabFold", "color": "#2F6BFF"},  # blue
+    "af3_rmsd":      {"label": "AF3",            "color": "#22A06B"},  # green
+    "vqe_rmsd":      {"label": "VQE",            "color": "#E24A33"},  # red
+}
+
+# 2) Font sizes
+FONT = {
+    "title": 16,
+    "axis_label": 14,
+    "tick": 10,
+    "legend": 11,
+    "annot": 10,
+}
+
+# 3) Plot parameters
+SORT_BY = "sampling_rmsd"   # "sampling_rmsd" or "pdb_id"
+MAX_CASES = None           # None means plot all; set int for debugging
 DPI = 300
 
+# Grouped bar chart layout
+BAR_WIDTH = 0.20
+ROTATE_X = 90
 
-# -----------------------------
-# Path helpers
-# -----------------------------
+# If you have many cases, you can tune these for readability
+FIG_WIDTH_PER_CASE = 0.35   # width scale for bar chart
+FIG_MIN_WIDTH = 12.0
+FIG_BAR_HEIGHT = 6.0
+
+# Boxplot options
+SHOW_OUTLIERS = True
+
+
+# ============================================================
+# Internal helpers
+# ============================================================
+
 def project_root_from_tools_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-# -----------------------------
-# Parsing utilities
-# -----------------------------
+def apply_font_rcparams():
+    # Global defaults; individual calls below also use FONT
+    plt.rcParams["axes.titlesize"] = FONT["title"]
+    plt.rcParams["axes.labelsize"] = FONT["axis_label"]
+    plt.rcParams["xtick.labelsize"] = FONT["tick"]
+    plt.rcParams["ytick.labelsize"] = FONT["tick"]
+    plt.rcParams["legend.fontsize"] = FONT["legend"]
+
+
 def read_rmsd_kv_txt(path: Path) -> Dict[str, float]:
     """
     Parse lines like:
@@ -103,9 +143,15 @@ def save_fig(fig: plt.Figure, out_png: Path, out_pdf: Path):
     plt.close(fig)
 
 
-# -----------------------------
+def method_order() -> List[str]:
+    # enforce consistent ordering across plots
+    return ["sampling_rmsd", "af2_rmsd", "af3_rmsd", "vqe_rmsd"]
+
+
+# ============================================================
 # Plotting
-# -----------------------------
+# ============================================================
+
 def plot_grouped_bar_all_cases(
     df: pd.DataFrame,
     out_png: Path,
@@ -115,24 +161,8 @@ def plot_grouped_bar_all_cases(
     Grouped bar chart per pdb_id for all sampling-available cases.
     Missing values in other methods are skipped (no bar drawn for that method/case).
     """
-    methods: List[Tuple[str, str]] = [
-        ("sampling_rmsd", "Sampling"),
-        ("af2_rmsd", "AF2 (ColabFold)"),
-        ("af3_rmsd", "AF3"),
-        ("vqe_rmsd", "VQE"),
-    ]
-
-    # fixed colors for readability (no seaborn)
-    colors = {
-        "sampling_rmsd": (0.45, 0.45, 0.45, 1.0),  # gray
-        "af2_rmsd": (0.20, 0.40, 0.80, 1.0),       # blue-ish
-        "af3_rmsd": (0.20, 0.70, 0.35, 1.0),       # green-ish
-        "vqe_rmsd": (0.85, 0.35, 0.20, 1.0),       # red-ish
-    }
-
     d = df.copy()
 
-    # sort
     if SORT_BY == "pdb_id":
         d = d.sort_values("pdb_id").reset_index(drop=True)
     else:
@@ -144,34 +174,39 @@ def plot_grouped_bar_all_cases(
     n = len(d)
     x = np.arange(n, dtype=float)
 
-    # dynamic figure width: ensure labels are readable
-    fig_w = max(12.0, 0.35 * n)  # increase with #cases
-    fig_h = 6.0
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig_w = max(FIG_MIN_WIDTH, FIG_WIDTH_PER_CASE * n)
+    fig, ax = plt.subplots(figsize=(fig_w, FIG_BAR_HEIGHT))
 
-    offsets = np.linspace(-1.5 * BAR_WIDTH, 1.5 * BAR_WIDTH, num=len(methods))
+    cols = method_order()
+    offsets = np.linspace(-1.5 * BAR_WIDTH, 1.5 * BAR_WIDTH, num=len(cols))
 
-    for (col, label), off in zip(methods, offsets):
+    for col, off in zip(cols, offsets):
+        if col not in d.columns:
+            continue
         y = pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float)
         mask = ~np.isnan(y)
-        if np.any(mask):
-            ax.bar(
-                x[mask] + off,
-                y[mask],
-                width=BAR_WIDTH,
-                label=f"{label} (n={int(mask.sum())})",
-                color=colors.get(col, None),
-            )
+        if not np.any(mask):
+            continue
+
+        label = METHOD_STYLES[col]["label"]
+        color = METHOD_STYLES[col]["color"]
+        ax.bar(
+            x[mask] + off,
+            y[mask],
+            width=BAR_WIDTH,
+            label=f"{label} (n={int(mask.sum())})",
+            color=color,
+        )
 
     ax.set_xticks(x)
     ax.set_xticklabels(d["pdb_id"].tolist(), rotation=ROTATE_X, ha="center")
     ax.set_ylabel("RMSD (Å)")
-    ax.set_title("Per-case RMSD comparison (only cases with Sampling results)")
-    ax.legend(frameon=False, ncol=2)
+    ax.set_title("Per-case RMSD comparison (only cases with Sampling results)", fontsize=FONT["title"])
+    ax.legend(frameon=False, ncol=2, fontsize=FONT["legend"])
 
-    # y limit a bit padded
+    # y-limit with padding
     y_all = []
-    for col, _ in methods:
+    for col in cols:
         y = pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float)
         y = y[~np.isnan(y)]
         if len(y) > 0:
@@ -179,6 +214,9 @@ def plot_grouped_bar_all_cases(
     if y_all:
         ymax = float(np.max(np.concatenate(y_all)))
         ax.set_ylim(0.0, ymax * 1.10)
+
+    # tick font size (in case rcParams not applied in some environments)
+    ax.tick_params(axis="both", labelsize=FONT["tick"])
 
     save_fig(fig, out_png, out_pdf)
 
@@ -189,40 +227,66 @@ def plot_boxplot_methods(
     out_pdf: Path,
 ):
     """
-    Boxplot comparing RMSD distributions across methods
-    (still on the sampling-id set; each method uses its available subset).
+    Boxplot comparing RMSD distributions across methods.
+    Same method color as bar chart.
+    Each method uses its available subset (still restricted to sampling-id set).
     """
-    methods: List[Tuple[str, str]] = [
-        ("sampling_rmsd", "Sampling"),
-        ("af2_rmsd", "AF2 (ColabFold)"),
-        ("af3_rmsd", "AF3"),
-        ("vqe_rmsd", "VQE"),
-    ]
+    cols = method_order()
 
     data = []
     labels = []
-    for col, name in methods:
+    colors = []
+
+    for col in cols:
+        if col not in df.columns:
+            continue
         vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
         if len(vals) == 0:
             continue
         data.append(vals)
-        labels.append(f"{name}\n(n={len(vals)})")
+        labels.append(f"{METHOD_STYLES[col]['label']}\n(n={len(vals)})")
+        colors.append(METHOD_STYLES[col]["color"])
 
     if not data:
         print("[SKIP] boxplot: no data")
         return
 
-    fig, ax = plt.subplots(figsize=(7.8, 5.6))
-    ax.boxplot(data, labels=labels, showfliers=True)
+    fig, ax = plt.subplots(figsize=(8.2, 5.8))
+    bp = ax.boxplot(
+        data,
+        labels=labels,
+        showfliers=SHOW_OUTLIERS,
+        patch_artist=True,   # allow box facecolor
+    )
+
+    # Color the boxes consistently with METHOD_STYLES
+    for box, c in zip(bp["boxes"], colors):
+        box.set_facecolor(c)
+        box.set_alpha(0.35)      # translucent fill for readability
+        box.set_linewidth(1.2)
+
+    # Color medians and whiskers for visibility
+    for median in bp["medians"]:
+        median.set_linewidth(1.6)
+    for whisker in bp["whiskers"]:
+        whisker.set_linewidth(1.2)
+    for cap in bp["caps"]:
+        cap.set_linewidth(1.2)
+
     ax.set_ylabel("RMSD (Å)")
-    ax.set_title("RMSD distribution comparison (sampling-available cases)")
+    ax.set_title("RMSD distribution comparison (sampling-available cases)", fontsize=FONT["title"])
+    ax.tick_params(axis="both", labelsize=FONT["tick"])
+
     save_fig(fig, out_png, out_pdf)
 
 
-# -----------------------------
+# ============================================================
 # Main
-# -----------------------------
+# ============================================================
+
 def main():
+    apply_font_rcparams()
+
     root = project_root_from_tools_dir()
     rmsd_dir = root / "QDock_RMSD"
 
@@ -257,7 +321,7 @@ def main():
     # Merge only on sampling ids
     rows = []
     for pid in sampling_ids:
-        # if duplicates exist, take the first sampling row
+        # if duplicates exist, take first
         srows = s_df.loc[s_df["pdb_id"] == pid, "sampling_rmsd"]
         s_val = safe_float(srows.iloc[0]) if len(srows) > 0 else None
 
@@ -282,14 +346,14 @@ def main():
     out_dir = rmsd_dir / "plots_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Grouped bar (all cases)
+    # 1) Grouped bar chart (all cases)
     plot_grouped_bar_all_cases(
         df,
         out_png=out_dir / "grouped_bar_all_cases.png",
         out_pdf=out_dir / "grouped_bar_all_cases.pdf",
     )
 
-    # 2) Boxplot
+    # 2) Boxplot (same method colors)
     plot_boxplot_methods(
         df,
         out_png=out_dir / "boxplot_methods.png",
@@ -308,5 +372,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
