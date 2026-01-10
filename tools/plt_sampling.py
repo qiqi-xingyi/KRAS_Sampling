@@ -4,7 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:plt_sampling.py
 
-# tools/plt_sampling.py
+
 # ------------------------------------------------------------
 # KRAS sampling distribution visualization (Plan A)
 # - Pooled structure-space embedding using bitstring Hamming distance (t-SNE)
