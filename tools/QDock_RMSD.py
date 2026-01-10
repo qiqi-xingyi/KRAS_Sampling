@@ -13,7 +13,7 @@
 #   <project_root>/dataset/QDockbank_info.txt
 #   <project_root>/dataset/Pdbbind/<pdb_id>/<pdb_id>_protein.pdb  (preferred)
 #                                     or <pdb_id>_pocket.pdb
-#
+
 # Outputs:
 #   For each decoded.jsonl:
 #     <same_dir>/backbone_rmsd.jsonl
