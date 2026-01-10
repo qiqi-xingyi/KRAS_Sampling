@@ -4,6 +4,36 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
+# --*-- coding:utf-8 --*--
+# @time:12/19/25
+# @Author : Yuqi Zhang
+# @File: tools/Plt_group_rmsd.py
+# ------------------------------------------------------------
+# Compare RMSD among four methods on the sampling-available set:
+#   - Sampling-based (from backbone_rmsd_min.csv)
+#   - AF2 (ColabFold) (from af2_rmsd_summary.txt)
+#   - AF3 (AlphaFold3) (from af3_rmsd_summary.txt)
+#   - VQE (from q_rmsd_summary.txt)
+#
+# Rule:
+#   ONLY plot pdb_ids that exist in sampling results.
+#   If other methods miss a pdb_id, skip those points.
+#
+# Plot request:
+#   - 1 bar chart (mean RMSD per method) with correlation-color encoding
+#   - 3 scatter plots (sampling vs AF2/AF3/VQE) with correlation-color encoding
+#
+# Inputs:
+#   <project_root>/QDock_RMSD/
+#     af2_rmsd_summary.txt
+#     af3_rmsd_summary.txt
+#     q_rmsd_summary.txt
+#     backbone_rmsd_min.csv
+#
+# Outputs:
+#   <project_root>/QDock_RMSD/merged_rmsd_on_sampling_ids.csv
+#   <project_root>/QDock_RMSD/plots_compare/*.png/pdf
+# ------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -26,9 +56,14 @@ def project_root_from_tools_dir() -> Path:
 # Parsing utilities
 # -----------------------------
 def read_rmsd_kv_txt(path: Path) -> Dict[str, float]:
-    """Parse lines: pdb_id <tab/spaces> rmsd ; ignore # comments."""
+    """
+    Parse lines like:
+      pdb_id <tab or spaces> rmsd
+    Ignore empty lines and comment lines starting with '#'.
+    """
     if not path.exists():
         return {}
+
     out: Dict[str, float] = {}
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -65,26 +100,27 @@ def safe_float(x) -> Optional[float]:
 def pearson_r(x: np.ndarray, y: np.ndarray) -> float:
     if len(x) < 2:
         return float("nan")
-    # remove constant vectors
     if np.std(x) < 1e-12 or np.std(y) < 1e-12:
         return float("nan")
     return float(np.corrcoef(x, y)[0, 1])
 
 
 def corr_to_color(r: float, cmap=plt.cm.coolwarm):
-    """Map r in [-1, 1] to a RGBA color. If r is nan, return gray."""
+    """
+    Map r in [-1, 1] to a RGBA color. If r is nan, return gray.
+    """
     if r is None or (isinstance(r, float) and np.isnan(r)):
         return (0.55, 0.55, 0.55, 1.0)
     r = max(-1.0, min(1.0, float(r)))
-    t = (r + 1.0) / 2.0  # [-1,1] -> [0,1]
+    t = (r + 1.0) / 2.0
     return cmap(t)
 
 
-def save_fig(out_png: Path, out_pdf: Path):
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
-    plt.savefig(out_pdf)
-    plt.close()
+def save_fig(fig: plt.Figure, out_png: Path, out_pdf: Path):
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    fig.savefig(out_pdf)
+    plt.close(fig)
 
 
 # -----------------------------
@@ -96,8 +132,8 @@ def plot_bar_means_with_corr_colors(
     out_pdf: Path,
 ):
     """
-    Bar chart: mean RMSD per method (on sampling-id set),
-    colors for AF2/AF3/VQE are based on correlation with sampling on paired subset.
+    Bar chart: mean RMSD per method (on sampling-id set).
+    Colors for AF2/AF3/VQE are based on Pearson correlation with sampling (paired subset).
     """
     methods = [
         ("sampling_rmsd", "Sampling"),
@@ -111,14 +147,13 @@ def plot_bar_means_with_corr_colors(
     ns = []
     colors = []
 
-    # sampling baseline color
     sampling_color = (0.45, 0.45, 0.45, 1.0)
 
-    # compute correlation for each other method vs sampling (paired subset)
-    for col, label in methods:
+    for col, _ in methods:
         vals = df[col].dropna().to_numpy(float)
         n = len(vals)
         ns.append(n)
+
         if n == 0:
             means.append(np.nan)
             sems.append(np.nan)
@@ -130,23 +165,31 @@ def plot_bar_means_with_corr_colors(
             colors.append(sampling_color)
         else:
             paired = df[["sampling_rmsd", col]].dropna()
-            r = pearson_r(paired["sampling_rmsd"].to_numpy(float), paired[col].to_numpy(float)) if not paired.empty else float("nan")
+            r = pearson_r(
+                paired["sampling_rmsd"].to_numpy(float),
+                paired[col].to_numpy(float),
+            ) if not paired.empty else float("nan")
             colors.append(corr_to_color(r))
 
-    x = np.arange(len(methods))
+    x = np.arange(len(methods), dtype=int)
 
-    plt.figure(figsize=(8.2, 5.3))
-    bars = plt.bar(x, means, yerr=sems, capsize=4, color=colors)
-    plt.xticks(x, [m[1] for m in methods], rotation=0)
-    plt.ylabel("RMSD (Å)")
-    plt.title("Mean RMSD on sampling-available cases\n(bar color encodes corr with Sampling for AF2/AF3/VQE)")
+    fig, ax = plt.subplots(figsize=(8.2, 5.3))
+    bars = ax.bar(x, means, yerr=sems, capsize=4, color=colors)
 
-    # annotate n
+    ax.set_xticks(x)
+    ax.set_xticklabels([m[1] for m in methods])
+    ax.set_ylabel("RMSD (Å)")
+    ax.set_title(
+        "Mean RMSD on sampling-available cases\n"
+        "AF2/AF3/VQE bar color encodes Pearson r vs Sampling"
+    )
+
+    # annotate n on top of each bar
     for i, b in enumerate(bars):
         h = b.get_height()
         if np.isnan(h):
             continue
-        plt.text(
+        ax.text(
             b.get_x() + b.get_width() / 2,
             h,
             f"n={ns[i]}",
@@ -155,13 +198,13 @@ def plot_bar_means_with_corr_colors(
             fontsize=10,
         )
 
-    # add a small colorbar legend for correlation
+    # colorbar (explicitly bind to ax)
     sm = plt.cm.ScalarMappable(cmap=plt.cm.coolwarm, norm=plt.Normalize(vmin=-1, vmax=1))
     sm.set_array([])
-    cbar = plt.colorbar(sm, pad=0.02)
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
     cbar.set_label("Pearson r vs Sampling")
 
-    save_fig(out_png, out_pdf)
+    save_fig(fig, out_png, out_pdf)
 
 
 def plot_scatter_corrcolored(
@@ -171,6 +214,10 @@ def plot_scatter_corrcolored(
     out_png: Path,
     out_pdf: Path,
 ):
+    """
+    Scatter: Sampling vs (method).
+    Point color is a single color determined by Pearson r for that paired subset.
+    """
     sub = df[["sampling_rmsd", y_col]].dropna()
     if sub.empty:
         print(f"[SKIP] scatter sampling vs {y_col}: no overlap")
@@ -187,23 +234,25 @@ def plot_scatter_corrcolored(
     lo -= pad
     hi += pad
 
-    plt.figure(figsize=(6.6, 6.0))
-    plt.scatter(x, y, s=20, alpha=0.75, color=color, edgecolors="none")
-    plt.plot([lo, hi], [lo, hi], linewidth=1.4, color=(0.3, 0.3, 0.3, 1.0))
-    plt.xlim(lo, hi)
-    plt.ylim(lo, hi)
-    plt.xlabel("Sampling RMSD (Å)")
-    plt.ylabel(f"{y_label} RMSD (Å)")
-    title_r = "nan" if np.isnan(r) else f"{r:.3f}"
-    plt.title(f"Sampling vs {y_label}   r={title_r}   n={len(sub)}")
+    fig, ax = plt.subplots(figsize=(6.6, 6.0))
+    ax.scatter(x, y, s=20, alpha=0.75, color=color, edgecolors="none")
+    ax.plot([lo, hi], [lo, hi], linewidth=1.4, color=(0.3, 0.3, 0.3, 1.0))
 
-    # colorbar for reference (optional, lightweight)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("Sampling RMSD (Å)")
+    ax.set_ylabel(f"{y_label} RMSD (Å)")
+
+    title_r = "nan" if np.isnan(r) else f"{r:.3f}"
+    ax.set_title(f"Sampling vs {y_label}   r={title_r}   n={len(sub)}")
+
+    # colorbar (explicitly bind to ax)
     sm = plt.cm.ScalarMappable(cmap=plt.cm.coolwarm, norm=plt.Normalize(vmin=-1, vmax=1))
     sm.set_array([])
-    cbar = plt.colorbar(sm, pad=0.02)
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
     cbar.set_label("Pearson r (color meaning)")
 
-    save_fig(out_png, out_pdf)
+    save_fig(fig, out_png, out_pdf)
 
 
 # -----------------------------
@@ -230,7 +279,8 @@ def main():
 
     s_df["pdb_id"] = s_df["pdb_id"].astype(str).str.strip().str.lower()
     s_df["sampling_rmsd"] = pd.to_numeric(s_df["min_rmsd"], errors="coerce")
-    sampling_ids = set(s_df["pdb_id"].tolist())
+
+    sampling_ids = sorted(set(s_df["pdb_id"].tolist()))
     print(f"[LOAD] sampling cases: {len(sampling_ids)}")
 
     # Load other methods
@@ -241,37 +291,40 @@ def main():
 
     # Merge only on sampling ids
     rows = []
-    for pid in sorted(sampling_ids):
-        # take the first sampling row if duplicates exist
+    for pid in sampling_ids:
+        # if duplicates exist in sampling_csv, take the first
         srows = s_df.loc[s_df["pdb_id"] == pid, "sampling_rmsd"]
         s_val = safe_float(srows.iloc[0]) if len(srows) > 0 else None
+
         rows.append(
             {
                 "pdb_id": pid,
                 "sampling_rmsd": s_val,
-                "af2_rmsd": safe_float(af2.get(pid, None)),
-                "af3_rmsd": safe_float(af3.get(pid, None)),
-                "vqe_rmsd": safe_float(vqe.get(pid, None)),
+                "af2_rmsd": safe_float(af2.get(pid)),
+                "af3_rmsd": safe_float(af3.get(pid)),
+                "vqe_rmsd": safe_float(vqe.get(pid)),
             }
         )
 
     df = pd.DataFrame(rows).dropna(subset=["sampling_rmsd"]).reset_index(drop=True)
 
+    # Save merged table
     merged_out = rmsd_dir / "merged_rmsd_on_sampling_ids.csv"
     df.to_csv(merged_out, index=False)
-    print(f"[SAVE] {merged_out} (n={len(df)})")
+    print(f"[SAVE] merged table: {merged_out} (n={len(df)})")
 
+    # Output plots
     out_dir = rmsd_dir / "plots_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) one bar chart
+    # 1 bar
     plot_bar_means_with_corr_colors(
         df,
         out_png=out_dir / "bar_mean_rmsd_corrcolor.png",
         out_pdf=out_dir / "bar_mean_rmsd_corrcolor.pdf",
     )
 
-    # 2) three scatters (corr-colored)
+    # 3 scatters
     plot_scatter_corrcolored(
         df,
         y_col="af2_rmsd",
@@ -294,9 +347,9 @@ def main():
         out_pdf=out_dir / "scatter_sampling_vs_vqe_corrcolor.pdf",
     )
 
-    # quick overlaps
+    # quick overlap stats
     print("\n[OVERLAP on sampling set]")
-    print(f"  sampling n = {len(df)}")
+    print(f"  Sampling n = {len(df)}")
     print(f"  AF2 overlap = {int(df['af2_rmsd'].notna().sum())}")
     print(f"  AF3 overlap = {int(df['af3_rmsd'].notna().sum())}")
     print(f"  VQE overlap = {int(df['vqe_rmsd'].notna().sum())}")
@@ -306,4 +359,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
