@@ -52,7 +52,6 @@ METHOD_STYLES = {
     "af3_rmsd":      {"label": "AF3",            "color": "#22A06B"},  # green
     "vqe_rmsd":      {"label": "VQE",            "color": "#E24A33"},  # red
 }
-
 # 2) Font sizes
 FONT = {
     "title": 16,
