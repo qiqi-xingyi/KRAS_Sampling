@@ -4,7 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
-
 # ------------------------------------------------------------
 # QDock RMSD comparison plots (on sampling-available cases):
 #   1) Grouped bar chart: per-case RMSD for ALL cases (Sampling defines the case set)
