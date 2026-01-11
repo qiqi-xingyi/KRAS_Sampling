@@ -73,7 +73,7 @@ FONT = {
 }
 
 # Export
-DPI = 300
+DPI = 600
 
 # Grid style (horizontal only)
 GRID_COLOR = "#D9D9D9"
