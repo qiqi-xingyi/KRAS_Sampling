@@ -11,7 +11,7 @@
 #   Fig1. Grouped bar chart (per-case, 4 methods)
 #   Fig2. Paired delta RMSD (baseline - sampling): box + jitter + median annotation
 #   FigS1. (Optional) 3-panel paired scatter: Sampling vs AF2/AF3/VQE with y=x and r, rho
-#
+
 # Inputs:
 #   <project_root>/QDock_RMSD/
 #     af2_rmsd_summary.txt
@@ -25,7 +25,7 @@
 #     fig1_grouped_bar.png/.pdf
 #     fig2_delta_box_jitter.png/.pdf
 #     figs1_scatter_triplet.png/.pdf
-#
+
 # Notes:
 # - Assumes your statement: for your 20 cases, all other 3 methods have results too.
 #   Script still handles missing values robustly (skips those points).
