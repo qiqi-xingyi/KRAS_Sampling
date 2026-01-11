@@ -63,10 +63,10 @@ METHODS: List[Tuple[str, str]] = [
 
 # Consistent colors across all plots (edit freely)
 METHOD_COLORS = {
-    "our_rmsd":        "#6E6E6E",  # gray
-    "colabfold_rmsd":  "#2F6BFF",  # blue
-    "af3_rmsd":        "#22A06B",  # green
-    "vqe_rmsd":        "#E24A33",  # red
+    "our_rmsd":        "#fd968f",
+    "colabfold_rmsd":  "#40c2a8",
+    "af3_rmsd":        "#73dbda",
+    "vqe_rmsd":        "#0e4577",
 }
 
 # Font sizes
