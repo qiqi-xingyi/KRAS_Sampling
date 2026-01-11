@@ -18,7 +18,7 @@
 #     af3_rmsd_summary.txt
 #     q_rmsd_summary.txt
 #     backbone_rmsd_min.csv   (sampling-based min RMSD per pdb_id)
-#
+
 # Outputs:
 #   <project_root>/QDock_RMSD/merged_rmsd_on_sampling_ids.csv
 #   <project_root>/QDock_RMSD/plots_topjournal/
