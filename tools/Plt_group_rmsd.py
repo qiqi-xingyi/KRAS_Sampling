@@ -79,7 +79,7 @@ FONT = {
 }
 
 # Export
-DPI = 300
+DPI = 600
 
 # Fig1 ordering
 SORT_BY = "our_rmsd"   # "our_rmsd" or "pdb_id"
