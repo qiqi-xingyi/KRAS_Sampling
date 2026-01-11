@@ -16,7 +16,9 @@
 # Figures:
 #   Fig1. Grouped bar chart (per-case, 4 methods)
 #   Fig2. Paired delta RMSD (baseline - our): box + jitter (journal style)
-#   FigS1. (Optional) 3-panel paired scatter: our vs colabfold/af3/vqe with y=x and r, rho
+#   FigS1. 3-panel paired scatter: our vs colabfold/af3/vqe with y=x
+#         Panel annotation method C:
+#           n + win% + median Δ + Spearman ρ
 #
 # Inputs:
 #   <project_root>/QDock_RMSD/
@@ -78,7 +80,7 @@ DPI = 300
 # Grid style (horizontal only)
 GRID_COLOR = "#D9D9D9"
 GRID_LINEWIDTH = 0.8
-GRID_ALPHA = 1.0
+GRID_ALPHA = 0.70  # a bit lighter than before for a cleaner look
 
 # Global spine style
 SPINE_LINEWIDTH = 1.0
@@ -100,7 +102,7 @@ FIG1_LEGEND_OUTSIDE = False
 FIG1_LEGEND_NCOL = 4
 
 # ----------------------------
-# Fig2: Delta box + jitter (journal-style recommended)
+# Fig2: Delta box + jitter (journal-style)
 # ----------------------------
 DELTA_ORDER: List[Tuple[str, str]] = [
     ("colabfold_rmsd", "colabfold − our"),
@@ -143,13 +145,27 @@ FIG2_TITLE = "ΔRMSD relative to our method"
 FIG2_YLABEL = "ΔRMSD (Å)"
 
 # ----------------------------
-# FigS1: Scatter triplet
+# FigS1: Scatter triplet (method C annotations)
 # ----------------------------
 ENABLE_SCATTER_TRIPLET = True
-SCATTER_POINT_SIZE = 34
-SCATTER_POINT_ALPHA = 0.85
+
+# Point + line styling
+SCATTER_POINT_SIZE = 30
+SCATTER_POINT_ALPHA = 0.82
+SCATTER_EDGE_COLOR = "#2E2E2E"
+SCATTER_EDGE_LINEWIDTH = 0.35
+
 DIAG_LINE_COLOR = "#333333"
-DIAG_LINEWIDTH = 1.2
+DIAG_LINEWIDTH = 1.0
+
+# Axis comparability (recommended)
+SCATTER_USE_GLOBAL_LIMITS = True     # same limits for all 3 panels
+SCATTER_EQUAL_ASPECT = True          # 1:1 aspect ratio
+SCATTER_PAD_FRAC = 0.06              # padding around global limits
+
+# Panel annotation (method C): n + win% + median Δ + Spearman rho
+SCATTER_TITLE_TEMPLATE = "{name}\n n={n}  win={win:.0f}%  Δ̃={dmed:.2f}Å  ρ={rho:.3f}"
+SCATTER_SUPTITLE = "Paired scatter comparisons (our vs baselines)"
 
 
 # ============================================================
@@ -422,17 +438,34 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
 
 # ============================================================
-# Plot: FigS1 scatter triplet
+# Plot: FigS1 scatter triplet (method C)
 # ============================================================
 
 def plot_figs1_scatter_triplet(df: pd.DataFrame, out_png: Path, out_pdf: Path):
-    fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.3), sharex=False, sharey=False)
-
     comps = [
         ("colabfold_rmsd", "colabfold"),
         ("af3_rmsd", "af3"),
         ("vqe_rmsd", "vqe"),
     ]
+
+    # Precompute global limits (same limits for all panels), only using paired points
+    paired_points = []
+    for col, _ in comps:
+        sub = df[["our_rmsd", col]].dropna()
+        if sub.empty:
+            continue
+        paired_points.append(sub[["our_rmsd", col]].to_numpy(float))
+
+    global_lo, global_hi = None, None
+    if SCATTER_USE_GLOBAL_LIMITS and paired_points:
+        A = np.vstack(paired_points)
+        lo = float(np.min(A))
+        hi = float(np.max(A))
+        pad = SCATTER_PAD_FRAC * (hi - lo + 1e-12)
+        global_lo = lo - pad
+        global_hi = hi + pad
+
+    fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.3), sharex=False, sharey=False)
 
     for ax, (col, name) in zip(axes, comps):
         sub = df[["our_rmsd", col]].dropna()
@@ -442,38 +475,57 @@ def plot_figs1_scatter_triplet(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
         x = sub["our_rmsd"].to_numpy(float)
         y = sub[col].to_numpy(float)
-        r = pearson_r(x, y)
+
+        # Method C metrics
+        n = int(len(sub))
+        win = 100.0 * float(np.mean(y > x))              # baseline worse than our
+        dmed = float(np.median(y - x))                   # median Δ = baseline - our
         rho = spearman_rho(x, y)
 
-        lo = float(min(x.min(), y.min()))
-        hi = float(max(x.max(), y.max()))
-        pad = 0.06 * (hi - lo + 1e-12)
-        lo -= pad
-        hi += pad
+        # Limits
+        if global_lo is not None and global_hi is not None:
+            lo, hi = global_lo, global_hi
+        else:
+            lo = float(min(x.min(), y.min()))
+            hi = float(max(x.max(), y.max()))
+            pad = SCATTER_PAD_FRAC * (hi - lo + 1e-12)
+            lo -= pad
+            hi += pad
 
+        # Scatter
         ax.scatter(
             x, y,
             s=SCATTER_POINT_SIZE,
             alpha=SCATTER_POINT_ALPHA,
             color=METHOD_COLORS.get(col, "#999999"),
-            edgecolors="none",
+            edgecolors=SCATTER_EDGE_COLOR,
+            linewidths=SCATTER_EDGE_LINEWIDTH,
             zorder=3,
         )
+
+        # Diagonal y=x
         ax.plot([lo, hi], [lo, hi], color=DIAG_LINE_COLOR, linewidth=DIAG_LINEWIDTH, zorder=2)
 
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
+
+        if SCATTER_EQUAL_ASPECT:
+            ax.set_aspect("equal", adjustable="box")
+
         ax.set_xlabel("our RMSD (Å)")
         ax.set_ylabel(f"{name} RMSD (Å)")
 
-        title_r = "nan" if np.isnan(r) else f"{r:.3f}"
-        title_rho = "nan" if np.isnan(rho) else f"{rho:.3f}"
-        ax.set_title(f"{name}\n n={len(sub)}  r={title_r}  ρ={title_rho}")
+        # Panel title (method C)
+        ax.set_title(
+            SCATTER_TITLE_TEMPLATE.format(
+                name=name, n=n, win=win, dmed=dmed, rho=rho
+            )
+        )
 
         add_horizontal_grid(ax)
         journal_spines(ax)
 
-    fig.suptitle("Paired scatter comparisons (our vs baselines)", fontsize=FONT["title"])
+    fig.suptitle(SCATTER_SUPTITLE, fontsize=FONT["title"])
     save_fig(fig, out_png, out_pdf)
 
 
