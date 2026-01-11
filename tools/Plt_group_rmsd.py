@@ -4,7 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
-
+# ------------------------------------------------------------
 # RMSD comparison plots (paired set, N≈20) in a clean journal style.
 #
 # Label convention:
@@ -47,7 +47,7 @@ import matplotlib.pyplot as plt
 # USER INTERFACES (EDIT HERE)
 # ============================================================
 
-# Display labels (must follow your naming convention)
+# Display labels
 METHODS: List[Tuple[str, str]] = [
     ("our_rmsd",        "our"),
     ("colabfold_rmsd",  "colabfold"),
@@ -55,7 +55,7 @@ METHODS: List[Tuple[str, str]] = [
     ("vqe_rmsd",        "vqe"),
 ]
 
-# Consistent colors across all plots (your palette)
+# Your palette
 METHOD_COLORS = {
     "our_rmsd":        "#fd968f",
     "colabfold_rmsd":  "#40c2a8",
@@ -91,12 +91,11 @@ BAR_WIDTH = 0.18
 GROUP_GAP = 0.35
 ROTATE_X = 45
 
-# Bar edge styling (requested)
+# Bar edge styling
 BAR_EDGE_COLOR = "#2E2E2E"
-BAR_EDGE_ALPHA = 0.55
 BAR_EDGE_LINEWIDTH = 0.6
 
-# Optional: put legend outside (more journal-ish). If True, legend goes above.
+# Optional: put legend outside
 FIG1_LEGEND_OUTSIDE = False
 FIG1_LEGEND_NCOL = 4
 
@@ -113,12 +112,13 @@ SHOW_OUTLIERS = True
 JITTER_WIDTH = 0.10
 RANDOM_SEED = 0
 
-# Boxplot line widths (requested detailed control)
+# Boxplot line widths (detailed control)
 BOX_WIDTH = 0.55
 BOX_EDGE_LINEWIDTH = 1.2
 MEDIAN_LINEWIDTH = 1.8
 WHISKER_LINEWIDTH = 1.2
 CAP_LINEWIDTH = 1.2
+BOX_EDGE_COLOR = "#2E2E2E"
 
 # Jitter points style
 JITTER_POINT_SIZE = 28
@@ -130,7 +130,7 @@ ZERO_LINE_LINEWIDTH = 1.2
 ZERO_LINE_STYLE = "--"
 
 # Median annotation style
-MEDIAN_TEXT_DY = 0.0   # vertical offset in data units; keep 0 for centered
+MEDIAN_TEXT_DY = 0.0   # vertical offset in data units
 MEDIAN_TEXT_VA = "bottom"
 
 # ----------------------------
@@ -229,6 +229,19 @@ def spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
     return pearson_r(rx, ry)
 
 
+def ax_boxplot_compat(ax: plt.Axes, data: List[np.ndarray], labels: List[str], **kwargs):
+    """
+    Matplotlib compatibility:
+      - In Matplotlib >= 3.9, boxplot() uses 'tick_labels'
+      - Older versions use 'labels'
+    This wrapper avoids the MatplotlibDeprecationWarning and keeps backward compatibility.
+    """
+    try:
+        return ax.boxplot(data, tick_labels=labels, **kwargs)  # Matplotlib >= 3.9
+    except TypeError:
+        return ax.boxplot(data, labels=labels, **kwargs)       # Older Matplotlib
+
+
 # ============================================================
 # Plot: Fig1 grouped bar (per-case)
 # ============================================================
@@ -267,11 +280,6 @@ def plot_fig1_grouped_bar(df: pd.DataFrame, out_png: Path, out_pdf: Path):
             linewidth=BAR_EDGE_LINEWIDTH,
             alpha=1.0,
         )
-
-    # soften bar edges by alpha (matplotlib doesn't support per-edge alpha directly)
-    # We approximate by setting edgecolor with RGBA if needed.
-    # Here we keep a subtle outline via BAR_EDGE_ALPHA.
-    # If you want true RGBA, set BAR_EDGE_COLOR to an rgba tuple.
 
     ax.set_xticks(x)
     ax.set_xticklabels(case_labels, rotation=ROTATE_X, ha="right")
@@ -314,17 +322,17 @@ def plot_fig1_grouped_bar(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
     rng = np.random.default_rng(RANDOM_SEED)
 
-    deltas = []
-    labels = []
-    colors = []
+    deltas: List[np.ndarray] = []
+    labels: List[str] = []
+    colors: List[str] = []
 
-    for base_col, label in DELTA_ORDER:
+    for base_col, lab in DELTA_ORDER:
         sub = df[["our_rmsd", base_col]].dropna()
         if sub.empty:
             continue
         delta = sub[base_col].to_numpy(float) - sub["our_rmsd"].to_numpy(float)
         deltas.append(delta)
-        labels.append(f"{label}\n(n={len(delta)})")
+        labels.append(f"{lab}\n(n={len(delta)})")
         colors.append(METHOD_COLORS.get(base_col, "#999999"))
 
     if not deltas:
@@ -333,7 +341,8 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
     fig, ax = plt.subplots(figsize=(8.0, 4.9))
 
-    bp = ax.boxplot(
+    bp = ax_boxplot_compat(
+        ax,
         deltas,
         labels=labels,
         showfliers=SHOW_OUTLIERS,
@@ -341,24 +350,23 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         widths=BOX_WIDTH,
     )
 
-    # Apply line widths and colors
     for box, c in zip(bp["boxes"], colors):
         box.set_facecolor(c)
         box.set_alpha(0.25)
         box.set_linewidth(BOX_EDGE_LINEWIDTH)
-        box.set_edgecolor("#2E2E2E")
+        box.set_edgecolor(BOX_EDGE_COLOR)
 
     for median in bp["medians"]:
         median.set_linewidth(MEDIAN_LINEWIDTH)
-        median.set_color("#2E2E2E")
+        median.set_color(BOX_EDGE_COLOR)
 
     for whisker in bp["whiskers"]:
         whisker.set_linewidth(WHISKER_LINEWIDTH)
-        whisker.set_color("#2E2E2E")
+        whisker.set_color(BOX_EDGE_COLOR)
 
     for cap in bp["caps"]:
         cap.set_linewidth(CAP_LINEWIDTH)
-        cap.set_color("#2E2E2E")
+        cap.set_color(BOX_EDGE_COLOR)
 
     # jitter points + median annotation
     for i, (delta, c) in enumerate(zip(deltas, colors), start=1):
@@ -520,7 +528,7 @@ def main():
     df.to_csv(merged_out, index=False)
     print(f"[SAVE] {merged_out} (n={len(df)})")
 
-    # output dir (no 'topjournal' in names)
+    # output dir
     out_dir = rmsd_dir / "plots_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -556,3 +564,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
