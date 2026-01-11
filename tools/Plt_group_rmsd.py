@@ -4,25 +4,19 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
-# --*-- coding:utf-8 --*--
-# @File: tools/Plt_group_rmsd.py
-# ------------------------------------------------------------
-# RMSD comparison plots (paired set, N=20) in a clean journal style.
+
+# RMSD comparison plots (paired set, N≈20) in a clean journal style.
 #
-# Label convention (as requested):
+# Label convention:
 #   - Sampling-based method: "our"
 #   - AF2 (ColabFold):       "colabfold"
 #   - AF3:                   "af3"
 #   - VQE:                   "vqe"
 #
-# Figures produced (same case set = our cases):
+# Figures:
 #   Fig1. Grouped bar chart (per-case, 4 methods)
 #   Fig2. Paired delta RMSD (baseline - our): box + jitter + median annotation
 #   FigS1. (Optional) 3-panel paired scatter: our vs colabfold/af3/vqe with y=x and r, rho
-#
-# All figures:
-#   - add light gray horizontal grid lines
-#   - consistent colors and typography
 #
 # Inputs:
 #   <project_root>/QDock_RMSD/
@@ -61,7 +55,7 @@ METHODS: List[Tuple[str, str]] = [
     ("vqe_rmsd",        "vqe"),
 ]
 
-# Consistent colors across all plots (edit freely)
+# Consistent colors across all plots (your palette)
 METHOD_COLORS = {
     "our_rmsd":        "#fd968f",
     "colabfold_rmsd":  "#40c2a8",
@@ -79,32 +73,74 @@ FONT = {
 }
 
 # Export
-DPI = 600
+DPI = 300
 
-# Fig1 ordering
+# Grid style (horizontal only)
+GRID_COLOR = "#D9D9D9"
+GRID_LINEWIDTH = 0.8
+GRID_ALPHA = 1.0
+
+# Global spine style
+SPINE_LINEWIDTH = 1.0
+
+# ----------------------------
+# Fig1: Grouped bar parameters
+# ----------------------------
 SORT_BY = "our_rmsd"   # "our_rmsd" or "pdb_id"
-
-# Fig1 grouped bar layout
 BAR_WIDTH = 0.18
 GROUP_GAP = 0.35
 ROTATE_X = 45
 
-# Fig2 delta plot: baseline - our (three baselines)
+# Bar edge styling (requested)
+BAR_EDGE_COLOR = "#2E2E2E"
+BAR_EDGE_ALPHA = 0.55
+BAR_EDGE_LINEWIDTH = 0.6
+
+# Optional: put legend outside (more journal-ish). If True, legend goes above.
+FIG1_LEGEND_OUTSIDE = False
+FIG1_LEGEND_NCOL = 4
+
+# ----------------------------
+# Fig2: Delta box + jitter
+# ----------------------------
 DELTA_ORDER: List[Tuple[str, str]] = [
     ("colabfold_rmsd", "colabfold − our"),
     ("af3_rmsd",       "af3 − our"),
     ("vqe_rmsd",       "vqe − our"),
 ]
+
 SHOW_OUTLIERS = True
 JITTER_WIDTH = 0.10
 RANDOM_SEED = 0
 
-# Optional scatter triplet
-ENABLE_SCATTER_TRIPLET = True
+# Boxplot line widths (requested detailed control)
+BOX_WIDTH = 0.55
+BOX_EDGE_LINEWIDTH = 1.2
+MEDIAN_LINEWIDTH = 1.8
+WHISKER_LINEWIDTH = 1.2
+CAP_LINEWIDTH = 1.2
 
-# Grid style (horizontal only)
-GRID_COLOR = "#D9D9D9"
-GRID_LINEWIDTH = 0.8
+# Jitter points style
+JITTER_POINT_SIZE = 28
+JITTER_POINT_ALPHA = 0.85
+
+# Reference line y=0 style
+ZERO_LINE_COLOR = "#333333"
+ZERO_LINE_LINEWIDTH = 1.2
+ZERO_LINE_STYLE = "--"
+
+# Median annotation style
+MEDIAN_TEXT_DY = 0.0   # vertical offset in data units; keep 0 for centered
+MEDIAN_TEXT_VA = "bottom"
+
+# ----------------------------
+# FigS1: Scatter triplet
+# ----------------------------
+ENABLE_SCATTER_TRIPLET = True
+SCATTER_POINT_SIZE = 34
+SCATTER_POINT_ALPHA = 0.85
+DIAG_LINE_COLOR = "#333333"
+DIAG_LINEWIDTH = 1.2
 
 
 # ============================================================
@@ -121,13 +157,13 @@ def apply_rcparams():
     plt.rcParams["xtick.labelsize"] = FONT["tick"]
     plt.rcParams["ytick.labelsize"] = FONT["tick"]
     plt.rcParams["legend.fontsize"] = FONT["legend"]
-    plt.rcParams["axes.linewidth"] = 1.0
+    plt.rcParams["axes.linewidth"] = SPINE_LINEWIDTH
     plt.rcParams["savefig.bbox"] = "tight"
 
 
 def add_horizontal_grid(ax: plt.Axes):
     ax.set_axisbelow(True)
-    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=GRID_LINEWIDTH)
+    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=GRID_LINEWIDTH, alpha=GRID_ALPHA)
     ax.xaxis.grid(False)
 
 
@@ -220,14 +256,22 @@ def plot_fig1_grouped_bar(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         mask = ~np.isnan(y)
         if not np.any(mask):
             continue
+
         ax.bar(
             x[mask] + off,
             y[mask],
             width=BAR_WIDTH,
             color=METHOD_COLORS.get(col, None),
             label=label,
-            linewidth=0.0,
+            edgecolor=BAR_EDGE_COLOR,
+            linewidth=BAR_EDGE_LINEWIDTH,
+            alpha=1.0,
         )
+
+    # soften bar edges by alpha (matplotlib doesn't support per-edge alpha directly)
+    # We approximate by setting edgecolor with RGBA if needed.
+    # Here we keep a subtle outline via BAR_EDGE_ALPHA.
+    # If you want true RGBA, set BAR_EDGE_COLOR to an rgba tuple.
 
     ax.set_xticks(x)
     ax.set_xticklabels(case_labels, rotation=ROTATE_X, ha="right")
@@ -237,10 +281,10 @@ def plot_fig1_grouped_bar(df: pd.DataFrame, out_png: Path, out_pdf: Path):
     # y range
     y_all = []
     for col, _ in METHODS:
-        y = pd.to_numeric(d[col], errors="coerce").to_numpy(float)
-        y = y[~np.isnan(y)]
-        if len(y) > 0:
-            y_all.append(y)
+        yv = pd.to_numeric(d[col], errors="coerce").to_numpy(float)
+        yv = yv[~np.isnan(yv)]
+        if len(yv) > 0:
+            y_all.append(yv)
     if y_all:
         ymax = float(np.max(np.concatenate(y_all)))
         ax.set_ylim(0.0, ymax * 1.12)
@@ -248,7 +292,17 @@ def plot_fig1_grouped_bar(df: pd.DataFrame, out_png: Path, out_pdf: Path):
     add_horizontal_grid(ax)
     journal_spines(ax)
 
-    ax.legend(frameon=False, ncol=4, loc="upper right")
+    if FIG1_LEGEND_OUTSIDE:
+        ax.legend(
+            frameon=False,
+            ncol=FIG1_LEGEND_NCOL,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.02),
+            borderaxespad=0.0,
+            handlelength=1.2,
+        )
+    else:
+        ax.legend(frameon=False, ncol=FIG1_LEGEND_NCOL, loc="upper right")
 
     save_fig(fig, out_png, out_pdf)
 
@@ -284,19 +338,27 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         labels=labels,
         showfliers=SHOW_OUTLIERS,
         patch_artist=True,
-        widths=0.55,
+        widths=BOX_WIDTH,
     )
 
+    # Apply line widths and colors
     for box, c in zip(bp["boxes"], colors):
         box.set_facecolor(c)
         box.set_alpha(0.25)
-        box.set_linewidth(1.2)
+        box.set_linewidth(BOX_EDGE_LINEWIDTH)
+        box.set_edgecolor("#2E2E2E")
+
     for median in bp["medians"]:
-        median.set_linewidth(1.6)
+        median.set_linewidth(MEDIAN_LINEWIDTH)
+        median.set_color("#2E2E2E")
+
     for whisker in bp["whiskers"]:
-        whisker.set_linewidth(1.2)
+        whisker.set_linewidth(WHISKER_LINEWIDTH)
+        whisker.set_color("#2E2E2E")
+
     for cap in bp["caps"]:
-        cap.set_linewidth(1.2)
+        cap.set_linewidth(CAP_LINEWIDTH)
+        cap.set_color("#2E2E2E")
 
     # jitter points + median annotation
     for i, (delta, c) in enumerate(zip(deltas, colors), start=1):
@@ -304,24 +366,33 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         ax.scatter(
             np.full(len(delta), i) + jitter,
             delta,
-            s=28,
-            alpha=0.85,
+            s=JITTER_POINT_SIZE,
+            alpha=JITTER_POINT_ALPHA,
             color=c,
             edgecolors="none",
             zorder=3,
         )
+
+        med = float(np.median(delta))
         ax.text(
             i,
-            float(np.median(delta)),
-            f"{np.median(delta):.2f}",
+            med + MEDIAN_TEXT_DY,
+            f"{med:.2f}",
             ha="center",
-            va="bottom",
+            va=MEDIAN_TEXT_VA,
             fontsize=FONT["annot"],
             color="black",
             zorder=4,
         )
 
-    ax.axhline(0.0, linewidth=1.2, linestyle="--", color="#333333")
+    ax.axhline(
+        0.0,
+        linewidth=ZERO_LINE_LINEWIDTH,
+        linestyle=ZERO_LINE_STYLE,
+        color=ZERO_LINE_COLOR,
+        zorder=2,
+    )
+
     ax.set_ylabel("ΔRMSD (Å) = RMSD(baseline) − RMSD(our)")
     ax.set_title("Paired per-case difference relative to our method (ΔRMSD)")
 
@@ -363,16 +434,16 @@ def plot_figs1_scatter_triplet(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
         ax.scatter(
             x, y,
-            s=34,
-            alpha=0.85,
+            s=SCATTER_POINT_SIZE,
+            alpha=SCATTER_POINT_ALPHA,
             color=METHOD_COLORS.get(col, "#999999"),
             edgecolors="none",
+            zorder=3,
         )
-        ax.plot([lo, hi], [lo, hi], color="#333333", linewidth=1.2)
+        ax.plot([lo, hi], [lo, hi], color=DIAG_LINE_COLOR, linewidth=DIAG_LINEWIDTH, zorder=2)
 
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
-
         ax.set_xlabel("our RMSD (Å)")
         ax.set_ylabel(f"{name} RMSD (Å)")
 
@@ -398,10 +469,10 @@ def main():
     rmsd_dir = root / "QDock_RMSD"
 
     # input files
-    colabfold_path = rmsd_dir / "af2_rmsd_summary.txt"   # AF2 / ColabFold
+    colabfold_path = rmsd_dir / "af2_rmsd_summary.txt"
     af3_path = rmsd_dir / "af3_rmsd_summary.txt"
     vqe_path = rmsd_dir / "q_rmsd_summary.txt"
-    our_csv = rmsd_dir / "backbone_rmsd_min.csv"         # sampling-based mins
+    our_csv = rmsd_dir / "backbone_rmsd_min.csv"
 
     if not rmsd_dir.exists():
         raise FileNotFoundError(f"Missing folder: {rmsd_dir}")
@@ -449,7 +520,7 @@ def main():
     df.to_csv(merged_out, index=False)
     print(f"[SAVE] {merged_out} (n={len(df)})")
 
-    # output dir + filenames (no 'topjournal' in names)
+    # output dir (no 'topjournal' in names)
     out_dir = rmsd_dir / "plots_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
