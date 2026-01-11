@@ -398,6 +398,5 @@ def main() -> None:
         print()
         print("JSON saved to:", str(out_path))
 
-
 if __name__ == "__main__":
     main()
