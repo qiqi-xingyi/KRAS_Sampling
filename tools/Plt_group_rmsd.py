@@ -5,7 +5,7 @@
 # @File:Plt_group_rmsd.py
 
 # ------------------------------------------------------------
-# RMSD comparison plots (paired set, N≈20) in a clean journal style.
+# RMSD comparison plots (paired set, ~20 cases) in a clean journal style.
 #
 # Label convention:
 #   - Sampling-based method: "our"
@@ -15,7 +15,7 @@
 #
 # Figures:
 #   Fig1. Grouped bar chart (per-case, 4 methods)
-#   Fig2. Paired delta RMSD (baseline - our): box + jitter + median annotation
+#   Fig2. Paired delta RMSD (baseline - our): box + jitter (journal style)
 #   FigS1. (Optional) 3-panel paired scatter: our vs colabfold/af3/vqe with y=x and r, rho
 #
 # Inputs:
@@ -55,7 +55,7 @@ METHODS: List[Tuple[str, str]] = [
     ("vqe_rmsd",        "vqe"),
 ]
 
-# Your palette
+# Your palette (requested)
 METHOD_COLORS = {
     "our_rmsd":        "#fd968f",
     "colabfold_rmsd":  "#40c2a8",
@@ -65,15 +65,15 @@ METHOD_COLORS = {
 
 # Font sizes
 FONT = {
-    "title": 13,
+    "title": 12,
     "axis": 12,
     "tick": 10,
     "legend": 10,
-    "annot": 10,
+    "annot": 9,
 }
 
 # Export
-DPI = 600
+DPI = 300
 
 # Grid style (horizontal only)
 GRID_COLOR = "#D9D9D9"
@@ -100,7 +100,7 @@ FIG1_LEGEND_OUTSIDE = False
 FIG1_LEGEND_NCOL = 4
 
 # ----------------------------
-# Fig2: Delta box + jitter
+# Fig2: Delta box + jitter (journal-style recommended)
 # ----------------------------
 DELTA_ORDER: List[Tuple[str, str]] = [
     ("colabfold_rmsd", "colabfold − our"),
@@ -108,30 +108,39 @@ DELTA_ORDER: List[Tuple[str, str]] = [
     ("vqe_rmsd",       "vqe − our"),
 ]
 
-SHOW_OUTLIERS = True
-JITTER_WIDTH = 0.10
+# Since we overlay all points via jitter, boxplot fliers are redundant
+SHOW_OUTLIERS = False
+
+# Jitter controls
 RANDOM_SEED = 0
+JITTER_WIDTH = 0.08
+JITTER_POINT_SIZE = 24
+JITTER_POINT_ALPHA = 0.75
 
-# Boxplot line widths (detailed control)
+# Box geometry + line widths
 BOX_WIDTH = 0.55
-BOX_EDGE_LINEWIDTH = 1.2
-MEDIAN_LINEWIDTH = 1.8
-WHISKER_LINEWIDTH = 1.2
-CAP_LINEWIDTH = 1.2
+BOX_EDGE_LINEWIDTH = 1.0
+WHISKER_LINEWIDTH = 1.0
+CAP_LINEWIDTH = 1.0
+MEDIAN_LINEWIDTH = 2.0
 BOX_EDGE_COLOR = "#2E2E2E"
+BOX_FACE_ALPHA = 0.18
 
-# Jitter points style
-JITTER_POINT_SIZE = 28
-JITTER_POINT_ALPHA = 0.85
-
-# Reference line y=0 style
+# Reference line at Δ=0
 ZERO_LINE_COLOR = "#333333"
 ZERO_LINE_LINEWIDTH = 1.2
 ZERO_LINE_STYLE = "--"
 
-# Median annotation style
-MEDIAN_TEXT_DY = 0.0   # vertical offset in data units
+# Median numeric annotation (recommended off for cleaner journal figure)
+ANNOTATE_MEDIAN = False
+MEDIAN_TEXT_FORMAT = "{:.2f}"
+MEDIAN_TEXT_DY = 0.08
 MEDIAN_TEXT_VA = "bottom"
+MEDIAN_TEXT_COLOR = "#111111"
+
+# Shorter text (recommended)
+FIG2_TITLE = "ΔRMSD relative to our method"
+FIG2_YLABEL = "ΔRMSD (Å)"
 
 # ----------------------------
 # FigS1: Scatter triplet
@@ -234,7 +243,7 @@ def ax_boxplot_compat(ax: plt.Axes, data: List[np.ndarray], labels: List[str], *
     Matplotlib compatibility:
       - In Matplotlib >= 3.9, boxplot() uses 'tick_labels'
       - Older versions use 'labels'
-    This wrapper avoids the MatplotlibDeprecationWarning and keeps backward compatibility.
+    This wrapper avoids MatplotlibDeprecationWarning and keeps backward compatibility.
     """
     try:
         return ax.boxplot(data, tick_labels=labels, **kwargs)  # Matplotlib >= 3.9
@@ -323,7 +332,7 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
     rng = np.random.default_rng(RANDOM_SEED)
 
     deltas: List[np.ndarray] = []
-    labels: List[str] = []
+    tick_labels: List[str] = []
     colors: List[str] = []
 
     for base_col, lab in DELTA_ORDER:
@@ -332,7 +341,7 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
             continue
         delta = sub[base_col].to_numpy(float) - sub["our_rmsd"].to_numpy(float)
         deltas.append(delta)
-        labels.append(f"{lab}\n(n={len(delta)})")
+        tick_labels.append(f"{lab}\n(n={len(delta)})")
         colors.append(METHOD_COLORS.get(base_col, "#999999"))
 
     if not deltas:
@@ -344,15 +353,16 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
     bp = ax_boxplot_compat(
         ax,
         deltas,
-        labels=labels,
+        labels=tick_labels,
         showfliers=SHOW_OUTLIERS,
         patch_artist=True,
         widths=BOX_WIDTH,
     )
 
+    # style box elements
     for box, c in zip(bp["boxes"], colors):
         box.set_facecolor(c)
-        box.set_alpha(0.25)
+        box.set_alpha(BOX_FACE_ALPHA)
         box.set_linewidth(BOX_EDGE_LINEWIDTH)
         box.set_edgecolor(BOX_EDGE_COLOR)
 
@@ -368,7 +378,7 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         cap.set_linewidth(CAP_LINEWIDTH)
         cap.set_color(BOX_EDGE_COLOR)
 
-    # jitter points + median annotation
+    # jitter points + optional median annotation
     for i, (delta, c) in enumerate(zip(deltas, colors), start=1):
         jitter = rng.uniform(-JITTER_WIDTH, JITTER_WIDTH, size=len(delta))
         ax.scatter(
@@ -381,17 +391,18 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
             zorder=3,
         )
 
-        med = float(np.median(delta))
-        ax.text(
-            i,
-            med + MEDIAN_TEXT_DY,
-            f"{med:.2f}",
-            ha="center",
-            va=MEDIAN_TEXT_VA,
-            fontsize=FONT["annot"],
-            color="black",
-            zorder=4,
-        )
+        if ANNOTATE_MEDIAN:
+            med = float(np.median(delta))
+            ax.text(
+                i,
+                med + MEDIAN_TEXT_DY,
+                MEDIAN_TEXT_FORMAT.format(med),
+                ha="center",
+                va=MEDIAN_TEXT_VA,
+                fontsize=FONT["annot"],
+                color=MEDIAN_TEXT_COLOR,
+                zorder=4,
+            )
 
     ax.axhline(
         0.0,
@@ -401,8 +412,8 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         zorder=2,
     )
 
-    ax.set_ylabel("ΔRMSD (Å) = RMSD(baseline) − RMSD(our)")
-    ax.set_title("Paired per-case difference relative to our method (ΔRMSD)")
+    ax.set_ylabel(FIG2_YLABEL)
+    ax.set_title(FIG2_TITLE)
 
     add_horizontal_grid(ax)
     journal_spines(ax)
@@ -564,4 +575,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
