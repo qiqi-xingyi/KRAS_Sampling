@@ -4,6 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:Plt_group_rmsd.py
 
+
 # ------------------------------------------------------------
 # RMSD comparison plots (paired set, ~20 cases) in a clean journal style.
 #
@@ -19,6 +20,9 @@
 #   FigS1. 3-panel paired scatter: our vs colabfold/af3/vqe with y=x
 #         Panel annotation method C:
 #           n + win% + median Δ + Spearman ρ
+#         Plus diagonal-side hints (light gray):
+#           baseline > our  (above diagonal)
+#           baseline < our  (below diagonal)
 #
 # Inputs:
 #   <project_root>/QDock_RMSD/
@@ -80,7 +84,7 @@ DPI = 300
 # Grid style (horizontal only)
 GRID_COLOR = "#D9D9D9"
 GRID_LINEWIDTH = 0.8
-GRID_ALPHA = 0.70  # a bit lighter than before for a cleaner look
+GRID_ALPHA = 0.70  # lighter for a cleaner look
 
 # Global spine style
 SPINE_LINEWIDTH = 1.0
@@ -166,6 +170,15 @@ SCATTER_PAD_FRAC = 0.06              # padding around global limits
 # Panel annotation (method C): n + win% + median Δ + Spearman rho
 SCATTER_TITLE_TEMPLATE = "{name}\n n={n}  win={win:.0f}%  Δ̃={dmed:.2f}Å  ρ={rho:.3f}"
 SCATTER_SUPTITLE = "Paired scatter comparisons (our vs baselines)"
+
+# Diagonal-side hints (light gray text)
+SHOW_DIAG_SIDE_HINTS = True
+DIAG_SIDE_HINT_COLOR = "#A6A6A6"
+DIAG_SIDE_HINT_FONTSIZE = 10
+DIAG_SIDE_HINT_ALPHA = 0.95
+# relative placement along the axis range
+DIAG_SIDE_HINT_POS = 0.80   # 0..1, where to place the label along diagonal direction
+DIAG_SIDE_HINT_OFFSET_FRAC = 0.09  # offset distance as fraction of axis span, away from diagonal
 
 
 # ============================================================
@@ -265,6 +278,52 @@ def ax_boxplot_compat(ax: plt.Axes, data: List[np.ndarray], labels: List[str], *
         return ax.boxplot(data, tick_labels=labels, **kwargs)  # Matplotlib >= 3.9
     except TypeError:
         return ax.boxplot(data, labels=labels, **kwargs)       # Older Matplotlib
+
+
+def add_diag_side_hints(ax: plt.Axes, lo: float, hi: float):
+    """
+    Add light-gray text near the diagonal y=x:
+      - above diagonal: baseline > our
+      - below diagonal: baseline < our
+
+    We place both labels at the same "along-diagonal" coordinate and offset them
+    by +/- (span * offset_frac) along the normal direction (1, -1).
+    """
+    if not SHOW_DIAG_SIDE_HINTS:
+        return
+
+    span = (hi - lo) + 1e-12
+    t = float(DIAG_SIDE_HINT_POS)
+    s = float(DIAG_SIDE_HINT_OFFSET_FRAC) * span
+
+    # point on diagonal
+    x0 = lo + t * (hi - lo)
+    y0 = x0
+
+    # normal directions to y=x are proportional to (1, -1) and (-1, 1)
+    # Above diagonal (y > x): move +s in y and -s in x (direction (-1, +1))
+    ax.text(
+        x0 - s, y0 + s,
+        "baseline > our",
+        color=DIAG_SIDE_HINT_COLOR,
+        fontsize=DIAG_SIDE_HINT_FONTSIZE,
+        alpha=DIAG_SIDE_HINT_ALPHA,
+        ha="center",
+        va="center",
+        zorder=4,
+    )
+
+    # Below diagonal (y < x): move +s in x and -s in y (direction (+1, -1))
+    ax.text(
+        x0 + s, y0 - s,
+        "baseline < our",
+        color=DIAG_SIDE_HINT_COLOR,
+        fontsize=DIAG_SIDE_HINT_FONTSIZE,
+        alpha=DIAG_SIDE_HINT_ALPHA,
+        ha="center",
+        va="center",
+        zorder=4,
+    )
 
 
 # ============================================================
@@ -438,7 +497,7 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
 
 # ============================================================
-# Plot: FigS1 scatter triplet (method C)
+# Plot: FigS1 scatter triplet (method C + diagonal-side hints)
 # ============================================================
 
 def plot_figs1_scatter_triplet(df: pd.DataFrame, out_png: Path, out_pdf: Path):
@@ -505,6 +564,9 @@ def plot_figs1_scatter_triplet(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
         # Diagonal y=x
         ax.plot([lo, hi], [lo, hi], color=DIAG_LINE_COLOR, linewidth=DIAG_LINEWIDTH, zorder=2)
+
+        # Diagonal-side hints
+        add_diag_side_hints(ax, lo=lo, hi=hi)
 
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
