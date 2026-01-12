@@ -21,6 +21,9 @@ GRID_N = 360                  # resolution for basin boundary grid (GRID_N x GRI
 KNN_K = 25                    # kNN neighbors for grid classification
 CHUNK = 25000                 # chunk size for grid neighbor queries
 
+# Save into a subfolder under figs/
+FIG_SUBDIR = "B_basins"       # outputs will go to KRAS_analysis/figs/B_basins/
+
 
 # -----------------------------
 # Path helpers
@@ -32,7 +35,7 @@ def kras_root_from_script() -> Path:
 
 def pick_file(data_used_dir: Path, preferred_name: str) -> Path:
     """
-    Prefer the numbered filename in data_used (e.g., 04_merged_points_with_basin.csv),
+    Prefer numbered filenames in data_used (e.g., 04_merged_points_with_basin.csv),
     but also support the raw base name if present.
     """
     candidates = sorted(data_used_dir.glob(f"*_{preferred_name}"))
@@ -136,17 +139,15 @@ def compute_basin_label_grid(
 
         dists, idxs = nn.kneighbors(pts, return_distance=True)
         neigh_basins = basin_ids[idxs]  # (M, k)
-
-        # inverse-distance weights
-        w = 1.0 / (dists + 1e-6)  # (M, k)
+        w = 1.0 / (dists + 1e-6)        # inverse-distance weights
 
         M, kk = neigh_basins.shape
         score = np.zeros((M, len(unique_basins)), dtype=float)
 
-        # accumulate weights for each basin
         for j in range(kk):
             bj = neigh_basins[:, j].astype(int)
             wj = w[:, j]
+            # map basin id -> column index
             col = np.fromiter((basin_to_index[int(b)] for b in bj), count=M, dtype=int)
             score[np.arange(M), col] += wj
 
@@ -156,10 +157,7 @@ def compute_basin_label_grid(
     return grid_labels, xs, ys
 
 
-def basin_centroids(
-    df: pd.DataFrame,
-    weight_col: Optional[str],
-) -> Dict[int, Tuple[float, float]]:
+def basin_centroids(df: pd.DataFrame, weight_col: Optional[str]) -> Dict[int, Tuple[float, float]]:
     cent: Dict[int, Tuple[float, float]] = {}
     for bid, g in df.groupby("basin_id"):
         if weight_col and weight_col in g.columns:
@@ -177,9 +175,6 @@ def basin_centroids(
 # Plot helpers
 # -----------------------------
 def draw_basin_boundaries(ax: plt.Axes, grid_labels: np.ndarray, xs: np.ndarray, ys: np.ndarray):
-    """
-    Draw boundaries by contouring each basin mask at level=0.5.
-    """
     unique_basins = np.unique(grid_labels).astype(int)
     extent = [xs[0], xs[-1], ys[0], ys[-1]]
 
@@ -233,19 +228,16 @@ def plot_density_with_basins(
     plt.figure(figsize=(7.2, 6.0))
     ax = plt.gca()
 
-    # IMPORTANT: capture the mappable returned by imshow
     im = ax.imshow(
         D.T,
         origin="lower",
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
     )
-    # IMPORTANT: bind the colorbar explicitly to the mappable and axis
     plt.colorbar(im, ax=ax, label="log(1 + probability mass)")
 
     draw_basin_boundaries(ax, grid_labels=grid_labels, xs=xs, ys=ys)
 
-    # basin numbers
     for bid, (cx, cy) in centroids.items():
         ax.text(cx, cy, str(bid), ha="center", va="center", fontsize=11, color="black")
 
@@ -254,6 +246,7 @@ def plot_density_with_basins(
     ax.set_ylabel("Structure axis 2 (t-SNE, Hamming)")
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
+
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
     plt.savefig(out_pdf)
@@ -276,7 +269,7 @@ def plot_basin_map_with_reps(
     plt.figure(figsize=(7.2, 6.0))
     ax = plt.gca()
 
-    # light pooled point background
+    # Light pooled background
     ax.scatter(df_all["z1"], df_all["z2"], s=3, alpha=0.15)
 
     draw_basin_boundaries(ax, grid_labels=grid_labels, xs=xs, ys=ys)
@@ -298,8 +291,8 @@ def plot_basin_map_with_reps(
     global_ = reps[reps["scope"].astype(str) == "global"]
 
     _scatter_subset(within[within["label"] == "WT"], marker="o", lab="WT reps")
-    _scatter_subset(within[within["label"] == "G12D"], marker="s", lab="G12D reps")
     _scatter_subset(within[within["label"] == "G12C"], marker="^", lab="G12C reps")
+    _scatter_subset(within[within["label"] == "G12D"], marker="s", lab="G12D reps")
     _scatter_subset(global_, marker="X", lab="Global reps")
 
     ax.set_title(title)
@@ -308,6 +301,7 @@ def plot_basin_map_with_reps(
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
     ax.legend(frameon=False, loc="best")
+
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
     plt.savefig(out_pdf)
@@ -319,9 +313,11 @@ def plot_basin_map_with_reps(
 # -----------------------------
 def main():
     root = kras_root_from_script()
+
     data_used = root / "data_used"
-    figs = root / "figs"
-    figs.mkdir(parents=True, exist_ok=True)
+    figs_root = root / "figs"
+    out_dir = figs_root / FIG_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     merged_path = pick_file(data_used, "merged_points_with_basin.csv")
     reps_path = pick_file(data_used, "representatives.csv")
@@ -352,8 +348,10 @@ def main():
     coords = df[["z1", "z2"]].to_numpy(dtype=float)
     basin_ids = df["basin_id"].to_numpy(dtype=int)
 
+    # Build basin boundary grid once (shared)
     print(f"[INFO] Using: {merged_path}")
     print(f"[INFO] Using: {reps_path}")
+    print(f"[INFO] Output dir: {out_dir}")
     print(f"[INFO] Points: {len(df)} | basins: {len(np.unique(basin_ids))}")
     print(f"[INFO] Grid: {GRID_N}x{GRID_N} | kNN: k={KNN_K}")
 
@@ -366,51 +364,35 @@ def main():
         k=KNN_K,
         chunk=CHUNK,
     )
-
     centroids = basin_centroids(df, weight_col=weight_col)
 
-    out_wt_png = figs / "B1_basins_overlay_WT.png"
-    out_wt_pdf = figs / "B1_basins_overlay_WT.pdf"
-    out_d_png = figs / "B2_basins_overlay_G12D.png"
-    out_d_pdf = figs / "B2_basins_overlay_G12D.pdf"
-    out_rep_png = figs / "B3_basins_representatives.png"
-    out_rep_pdf = figs / "B3_basins_representatives.pdf"
+    # ---- Outputs: three labels ----
+    for i, lab in enumerate(["WT", "G12C", "G12D"], start=1):
+        out_png = out_dir / f"B{i}_basins_overlay_{lab}.png"
+        out_pdf = out_dir / f"B{i}_basins_overlay_{lab}.pdf"
+        plot_density_with_basins(
+            df=df,
+            label=lab,
+            out_png=out_png,
+            out_pdf=out_pdf,
+            title=f"{lab} density with basin boundaries",
+            xlim=xlim,
+            ylim=ylim,
+            grid_labels=grid_labels,
+            xs=xs,
+            ys=ys,
+            centroids=centroids,
+            weight_col=weight_col,
+        )
 
-    plot_density_with_basins(
-        df=df,
-        label="WT",
-        out_png=out_wt_png,
-        out_pdf=out_wt_pdf,
-        title="WT density with basin boundaries",
-        xlim=xlim,
-        ylim=ylim,
-        grid_labels=grid_labels,
-        xs=xs,
-        ys=ys,
-        centroids=centroids,
-        weight_col=weight_col,
-    )
-
-    plot_density_with_basins(
-        df=df,
-        label="G12D",
-        out_png=out_d_png,
-        out_pdf=out_d_pdf,
-        title="G12D density with basin boundaries",
-        xlim=xlim,
-        ylim=ylim,
-        grid_labels=grid_labels,
-        xs=xs,
-        ys=ys,
-        centroids=centroids,
-        weight_col=weight_col,
-    )
-
+    # Representatives map
+    rep_png = out_dir / "B4_basins_representatives.png"
+    rep_pdf = out_dir / "B4_basins_representatives.pdf"
     plot_basin_map_with_reps(
         df_all=df,
         reps=reps,
-        out_png=out_rep_png,
-        out_pdf=out_rep_pdf,
+        out_png=rep_png,
+        out_pdf=rep_pdf,
         title="Basin map with representative points",
         xlim=xlim,
         ylim=ylim,
@@ -420,8 +402,8 @@ def main():
         centroids=centroids,
     )
 
-    # manifest for traceability
-    manifest = figs / "B_manifest.json"
+    # Manifest
+    manifest = out_dir / "B_manifest.json"
     payload = {
         "inputs": {
             "merged_points_with_basin": str(merged_path),
@@ -434,20 +416,22 @@ def main():
             "KNN_K": KNN_K,
             "CHUNK": CHUNK,
             "weight_col": weight_col,
+            "FIG_SUBDIR": FIG_SUBDIR,
         },
         "outputs": [
-            str(out_wt_png), str(out_wt_pdf),
-            str(out_d_png), str(out_d_pdf),
-            str(out_rep_png), str(out_rep_pdf),
+            str(out_dir / "B1_basins_overlay_WT.png"),
+            str(out_dir / "B2_basins_overlay_G12C.png"),
+            str(out_dir / "B3_basins_overlay_G12D.png"),
+            str(rep_png),
         ],
     }
     with open(manifest, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    print("\n[DONE] Saved:")
+    print("\n[DONE] Saved to:", out_dir)
     for p in payload["outputs"]:
-        print(f"  - {Path(p).name}")
-    print(f"  - {manifest.name}")
+        print("  -", Path(p).name)
+    print("  -", manifest.name)
 
 
 if __name__ == "__main__":
