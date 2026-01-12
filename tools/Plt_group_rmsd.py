@@ -672,8 +672,8 @@ def main():
     if ENABLE_SCATTER_TRIPLET:
         plot_figs1_scatter_triplet(
             df,
-            out_png=out_dir / "figS1_scatter_triplet.png",
-            out_pdf=out_dir / "figS1_scatter_triplet.pdf",
+            out_png=out_dir / "fig3_scatter_triplet.png",
+            out_pdf=out_dir / "fig3_scatter_triplet.pdf",
         )
 
     # coverage check
