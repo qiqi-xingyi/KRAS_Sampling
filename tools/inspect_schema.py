@@ -4,41 +4,26 @@
 # @Email : yzhan135@kent.edu
 # @File:inspect_schema.py
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import argparse
-import csv as _csv
 import json
-import os
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 
 import pandas as pd
 
 
-SKIP_DIR_NAMES = {
-    "figs", "fig", "figures", "plots", "plot", "figs_redraw", "plots_addon"
-}
-SKIP_EXTS = {
-    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".pdb", ".pdbqt", ".pml"
-}
+SKIP_DIR_NAMES = {"figs", "fig", "figures", "plots", "plot", "figs_redraw", "plots_addon"}
+SKIP_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".pdb", ".pdbqt", ".pml"}
+
+CANDIDATE_DELIMS = [",", "\t", ";", "|"]
 
 
 def project_root_from_tools() -> Path:
-    # If this script is in tools/, project root is tools/..
     return Path(__file__).resolve().parents[1]
-
-
-def sniff_delimiter(path: Path, default: str = ",") -> str:
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            sample = f.read(8192)
-        if not sample.strip():
-            return default
-        dialect = _csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|"])
-        return dialect.delimiter
-    except Exception:
-        return default
 
 
 def safe_stat(path: Path) -> Dict[str, Any]:
@@ -50,42 +35,100 @@ def safe_stat(path: Path) -> Dict[str, Any]:
 
 
 def normalize_col(name: str) -> str:
-    # Normalize to help detect near-duplicates across files
-    return (
-        name.strip()
-        .lower()
-        .replace(" ", "_")
-        .replace("-", "_")
-        .replace("__", "_")
-    )
+    return name.strip().lower().replace(" ", "_").replace("-", "_").replace("__", "_")
 
 
-def read_csv_schema(path: Path, infer_rows: int = 200) -> Tuple[List[str], Dict[str, str]]:
-    delim = sniff_delimiter(path)
-    # Header only for columns
-    df0 = pd.read_csv(path, sep=delim, nrows=0, engine="python")
-    cols = list(df0.columns)
+def first_data_line(path: Path, max_lines: int = 50) -> Optional[str]:
+    """
+    Return the first non-empty, non-comment line as header candidate.
+    """
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as f:
+        for _ in range(max_lines):
+            line = f.readline()
+            if not line:
+                break
+            s = line.strip("\n").strip("\r").strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                continue
+            return s
+    return None
 
-    # Infer dtypes from a small sample
-    dtypes: Dict[str, str] = {}
-    if infer_rows > 0:
-        dfi = pd.read_csv(path, sep=delim, nrows=infer_rows, engine="python", low_memory=False)
-        for c in cols:
-            dtypes[c] = str(dfi[c].dtype) if c in dfi.columns else "unknown"
-    else:
-        for c in cols:
-            dtypes[c] = "unknown"
 
-    return cols, dtypes
+def split_header_best(line: str) -> Tuple[List[str], str]:
+    """
+    Try multiple delimiters and pick the one that yields the most columns.
+    Also handles whitespace-separated header as a fallback.
+    """
+    best_cols: List[str] = [line.strip()]
+    best_delim = "RAW"
+
+    for d in CANDIDATE_DELIMS:
+        cols = [c.strip() for c in line.split(d)]
+        cols = [c for c in cols if c != ""]
+        if len(cols) > len(best_cols):
+            best_cols = cols
+            best_delim = d
+
+    # whitespace fallback (only if it seems like a table header)
+    ws_cols = [c.strip() for c in line.split()]
+    ws_cols = [c for c in ws_cols if c != ""]
+    if len(ws_cols) > len(best_cols) and len(ws_cols) >= 2:
+        best_cols = ws_cols
+        best_delim = "WHITESPACE"
+
+    return best_cols, best_delim
+
+
+def read_csv_schema_robust(path: Path, infer_rows: int = 200) -> Tuple[List[str], Dict[str, str], str, str]:
+    """
+    Return (columns, dtype_preview_map, delimiter_used, parse_mode)
+    parse_mode: header_only | pandas_sample | header_fallback
+    """
+    header = first_data_line(path)
+    if header is None:
+        return [], {}, "EMPTY", "header_fallback"
+
+    cols, delim = split_header_best(header)
+
+    # If we only got 1 column, still try pandas with common separators to see if file has real header
+    dtypes: Dict[str, str] = {c: "unknown" for c in cols}
+
+    # Try pandas sample only when we have >=2 columns, otherwise it may be misleading.
+    if infer_rows > 0 and len(cols) >= 2:
+        try:
+            sep = "\t" if delim == "WHITESPACE" else ("," if delim == "RAW" else delim)
+            # pandas can't directly use WHITESPACE as sep here; use delim_whitespace
+            if delim == "WHITESPACE":
+                dfi = pd.read_csv(path, nrows=infer_rows, engine="python", delim_whitespace=True, low_memory=False)
+            else:
+                dfi = pd.read_csv(path, sep=sep, nrows=infer_rows, engine="python", low_memory=False, on_bad_lines="skip")
+
+            # Re-take columns from pandas if it parsed more convincingly
+            if len(dfi.columns) > len(cols):
+                cols = list(map(str, dfi.columns))
+                dtypes = {c: str(dfi[c].dtype) for c in cols}
+                return cols, dtypes, "PANDAS_AUTO", "pandas_sample"
+
+            # normal dtype inference
+            for c in cols:
+                if c in dfi.columns:
+                    dtypes[c] = str(dfi[c].dtype)
+            return cols, dtypes, delim, "pandas_sample"
+        except Exception:
+            # If pandas fails, keep header-only result
+            return cols, dtypes, delim, "header_only"
+
+    return cols, dtypes, delim, "header_only"
 
 
 def read_json_schema(path: Path) -> List[str]:
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as f:
         obj = json.load(f)
     if isinstance(obj, dict):
         return list(obj.keys())
     if isinstance(obj, list) and obj:
-        # If list of dicts, union keys
         keys = set()
         for item in obj[:50]:
             if isinstance(item, dict):
@@ -97,13 +140,13 @@ def read_json_schema(path: Path) -> List[str]:
 def read_jsonl_schema(path: Path, max_lines: int = 2000) -> List[str]:
     keys = set()
     n = 0
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            s = line.strip()
+            if not s:
                 continue
             try:
-                obj = json.loads(line)
+                obj = json.loads(s)
                 if isinstance(obj, dict):
                     keys.update(obj.keys())
             except Exception:
@@ -114,28 +157,15 @@ def read_jsonl_schema(path: Path, max_lines: int = 2000) -> List[str]:
     return sorted(keys)
 
 
-def count_rows_fast(path: Path) -> int:
-    # Counts data rows for CSV/TSV-like files (excluding header).
-    # This is optional because it can be slow for very large files.
-    with path.open("rb") as f:
-        n = 0
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            n += chunk.count(b"\n")
-    # Approx: number of lines - 1 header (>=0)
-    return max(0, n - 1)
-
-
 def iter_data_files(root: Path) -> List[Path]:
     files: List[Path] = []
     for p in root.rglob("*"):
         if p.is_dir():
             if p.name in SKIP_DIR_NAMES:
-                # skip known figure directories
                 continue
             continue
         if p.suffix.lower() in SKIP_EXTS:
             continue
-        # Skip obvious caches
         if p.name.startswith("."):
             continue
         files.append(p)
@@ -144,20 +174,9 @@ def iter_data_files(root: Path) -> List[Path]:
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect schema (columns/keys) for analysis_closed_loop outputs.")
-    parser.add_argument(
-        "--analysis_dir",
-        type=str,
-        default="KRAS_sampling_results/analysis_closed_loop",
-        help="Path to analysis_closed_loop (relative to project root by default).",
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="KRAS_sampling_results/analysis_closed_loop/_schema_report",
-        help="Output directory (relative to project root by default).",
-    )
-    parser.add_argument("--infer_rows", type=int, default=200, help="Rows to sample for dtype inference (CSV).")
-    parser.add_argument("--count_rows", action="store_true", help="Count CSV data rows (can be slow).")
+    parser.add_argument("--analysis_dir", type=str, default="KRAS_sampling_results/analysis_closed_loop")
+    parser.add_argument("--out_dir", type=str, default="KRAS_sampling_results/analysis_closed_loop/_schema_report")
+    parser.add_argument("--infer_rows", type=int, default=200)
 
     args = parser.parse_args()
 
@@ -187,18 +206,17 @@ def main():
             "n_cols": 0,
             "cols_or_keys": "",
             "dtype_preview": "",
-            "row_count": "",
             "parse_status": "ok",
+            "extra": "",
         }
 
         try:
             if ext in {".csv", ".tsv"}:
-                cols, dtypes = read_csv_schema(fp, infer_rows=args.infer_rows)
+                cols, dtypes, delim_used, mode = read_csv_schema_robust(fp, infer_rows=args.infer_rows)
                 record["n_cols"] = len(cols)
                 record["cols_or_keys"] = "|".join([str(c) for c in cols])
                 record["dtype_preview"] = "|".join([f"{c}:{dtypes.get(c,'')}" for c in cols[:60]])
-                if args.count_rows:
-                    record["row_count"] = str(count_rows_fast(fp))
+                record["extra"] = f"delim={delim_used};mode={mode}"
 
                 for c in cols:
                     columns_to_files.setdefault(c, []).append(rel)
@@ -229,29 +247,25 @@ def main():
                     if k not in norm_to_raw[nk]:
                         norm_to_raw[nk].append(k)
             else:
-                # Unknown text-like file, just record it
                 record["parse_status"] = "skipped_unknown_ext"
 
         except Exception as e:
             record["parse_status"] = f"error:{type(e).__name__}"
             record["cols_or_keys"] = ""
             record["dtype_preview"] = ""
+            record["extra"] = str(e)[:200]
 
         file_records.append(record)
 
-    # Save per-file index
     df = pd.DataFrame(file_records)
     df.to_csv(out_dir / "files_index.csv", index=False)
 
-    # Save column->files mapping
     with (out_dir / "columns_to_files.json").open("w", encoding="utf-8") as f:
         json.dump(columns_to_files, f, indent=2, ensure_ascii=False)
 
-    # Save normalized name map (helps align basin_id vs basin, etc.)
     with (out_dir / "normalized_to_raw_columns.json").open("w", encoding="utf-8") as f:
         json.dump(norm_to_raw, f, indent=2, ensure_ascii=False)
 
-    # Convenience summary
     summary = {
         "analysis_dir": str(analysis_dir),
         "n_files_scanned": len(files),
@@ -267,3 +281,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
