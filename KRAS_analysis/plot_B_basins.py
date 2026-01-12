@@ -1,43 +1,63 @@
 # plot_B_basins.py
+# ------------------------------------------------------------
+# KRAS basin visualization (Plan B, light theme + frosted masks)
+#
+# Inputs (under KRAS_analysis/data_used):
+#   *_merged_points_with_basin.csv   (required)
+#     expected columns: z1, z2, label, basin_id, [weight/prob/count/mass... optional]
+#
+# Outputs:
+#   KRAS_analysis/figs/B_basins/
+#     B1_density_with_basins_WT.png/.pdf
+#     B2_density_with_basins_G12C.png/.pdf
+#     B3_density_with_basins_G12D.png/.pdf
+#     B4_basin_legend.png/.pdf
+#     B_manifest.json
+# ------------------------------------------------------------
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
-from sklearn.neighbors import NearestNeighbors
+import matplotlib.patheffects as pe
+from matplotlib.patches import Rectangle, Patch
 
 
 # -----------------------------
 # Parameters (IDE-friendly)
 # -----------------------------
-DENSITY_BINS = 220            # histogram bins for density background
-SMOOTH_SIGMA = 1.2            # light smoothing (bin units)
-GRID_N = 360                  # resolution for basin boundary grid (GRID_N x GRID_N)
-KNN_K = 25                    # kNN neighbors for grid classification
-CHUNK = 25000                 # chunk size for grid neighbor queries
+FIG_SUBDIR = "B_basins"
 
-# Save into a subfolder under figs/
-FIG_SUBDIR = "B_basins"       # outputs will go to KRAS_analysis/figs/B_basins/
+TARGET_LABELS = ["WT", "G12C", "G12D"]
+
+# density
+BINS = 240
+SMOOTH_SIGMA = 1.2  # in bin units
+
+# basin region rendering
+GRID_N = 520                 # grid resolution for basin masks/boundaries
+MASK_ALPHA = 0.22            # basin overlay opacity
+MASK_BLUR_SIGMA = 2.2        # "frosted glass" softness (grid units)
+PALETTE = "tab20"            # basin region colors
+
+# light theme / heatmap
+HEATMAP_CMAP = "cividis"     # good on light background
+GLASS_VEIL_ALPHA = 0.06      # subtle white veil on top
 
 
 # -----------------------------
 # Path helpers
 # -----------------------------
 def kras_root_from_script() -> Path:
-    # This script is placed in KRAS_analysis/
     return Path(__file__).resolve().parent
 
 
 def pick_file(data_used_dir: Path, preferred_name: str) -> Path:
-    """
-    Prefer numbered filenames in data_used (e.g., 04_merged_points_with_basin.csv),
-    but also support the raw base name if present.
-    """
     candidates = sorted(data_used_dir.glob(f"*_{preferred_name}"))
     if candidates:
         return candidates[0]
@@ -51,11 +71,16 @@ def pick_file(data_used_dir: Path, preferred_name: str) -> Path:
 
 
 # -----------------------------
-# Smoothing
+# Smoothing utilities
 # -----------------------------
 def gaussian_smooth_2d(H: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Light 2D Gaussian smoothing for density histograms.
+    Tries scipy first; falls back to numpy separable convolution.
+    """
     if sigma is None or sigma <= 0:
         return H
+
     try:
         from scipy.ndimage import gaussian_filter  # type: ignore
         return gaussian_filter(H, sigma=float(sigma), mode="nearest")
@@ -71,8 +96,31 @@ def gaussian_smooth_2d(H: np.ndarray, sigma: float) -> np.ndarray:
         return H1
 
 
+def gaussian_blur_2d(M: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Blur for basin masks (for 'frosted glass' soft edges).
+    Tries scipy first; falls back to separable numpy convolution.
+    """
+    if sigma is None or sigma <= 0:
+        return M
+
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore
+        return gaussian_filter(M.astype(float), sigma=float(sigma), mode="nearest")
+    except Exception:
+        s = float(sigma)
+        radius = max(1, int(3 * s))
+        x = np.arange(-radius, radius + 1, dtype=float)
+        k = np.exp(-0.5 * (x / s) ** 2)
+        k = k / (k.sum() + 1e-12)
+
+        M0 = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 0, M.astype(float))
+        M1 = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, M0)
+        return M1
+
+
 # -----------------------------
-# Density grid
+# Density utilities
 # -----------------------------
 def hist2d_weighted(
     Z: np.ndarray,
@@ -84,96 +132,112 @@ def hist2d_weighted(
     normalize: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     H, xedges, yedges = np.histogram2d(
-        Z[:, 0],
-        Z[:, 1],
+        Z[:, 0], Z[:, 1],
         bins=bins,
         range=[list(xlim), list(ylim)],
         weights=weights,
     )
     if smooth_sigma and smooth_sigma > 0:
-        H = gaussian_smooth_2d(H, sigma=smooth_sigma)
+        H = gaussian_smooth_2d(H, sigma=float(smooth_sigma))
 
     if normalize:
         s = float(H.sum())
         if s > 0:
             H = H / s
+
     return H, xedges, yedges
 
 
 # -----------------------------
-# Basin boundary grid (kNN voting)
+# Basin partition (Voronoi by centroid)
 # -----------------------------
-def compute_basin_label_grid(
-    coords: np.ndarray,
-    basin_ids: np.ndarray,
+def compute_basin_centroids(df: pd.DataFrame) -> Dict[int, Tuple[float, float]]:
+    """
+    Compute basin centroids in embedding space using ALL points.
+    """
+    if "basin_id" not in df.columns:
+        raise ValueError("merged_points_with_basin.csv missing 'basin_id'")
+    if "z1" not in df.columns or "z2" not in df.columns:
+        raise ValueError("merged_points_with_basin.csv missing 'z1'/'z2'")
+
+    tmp = df.copy()
+    tmp["basin_id"] = pd.to_numeric(tmp["basin_id"], errors="coerce")
+    tmp = tmp.dropna(subset=["basin_id"]).copy()
+    tmp["basin_id"] = tmp["basin_id"].astype(int)
+
+    g = tmp.groupby("basin_id")[["z1", "z2"]].mean()
+    centroids: Dict[int, Tuple[float, float]] = {int(i): (float(r["z1"]), float(r["z2"])) for i, r in g.iterrows()}
+    return centroids
+
+
+def build_voronoi_grid_labels(
+    centroids: Dict[int, Tuple[float, float]],
     xlim: Tuple[float, float],
     ylim: Tuple[float, float],
     grid_n: int,
-    k: int,
-    chunk: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Create a grid in (z1, z2) and assign each grid cell a basin_id via inverse-distance
-    weighted kNN voting.
-    Returns:
-      grid_labels: (grid_n, grid_n) int
-      xs: x coordinates (grid_n,)
-      ys: y coordinates (grid_n,)
+    Assign each grid point to nearest centroid (Euclidean) -> basin grid labels.
+    Returns: (grid_labels[Ny,Nx], xs[Nx], ys[Ny])
     """
-    xs = np.linspace(xlim[0], xlim[1], grid_n)
-    ys = np.linspace(ylim[0], ylim[1], grid_n)
-    XX, YY = np.meshgrid(xs, ys, indexing="xy")
-    grid_points = np.column_stack([XX.ravel(), YY.ravel()])
+    basin_ids = sorted(centroids.keys())
+    C = np.array([centroids[b] for b in basin_ids], dtype=float)  # (K,2)
 
-    nn = NearestNeighbors(n_neighbors=min(k, len(coords)), algorithm="auto")
-    nn.fit(coords)
+    xs = np.linspace(xlim[0], xlim[1], grid_n, dtype=float)
+    ys = np.linspace(ylim[0], ylim[1], grid_n, dtype=float)
+    Xg, Yg = np.meshgrid(xs, ys)
+    P = np.stack([Xg, Yg], axis=-1)  # (Ny,Nx,2)
 
-    unique_basins = np.unique(basin_ids).astype(int)
-    basin_to_index = {b: i for i, b in enumerate(unique_basins)}
+    # compute squared distance to each centroid: (Ny,Nx,K)
+    # broadcast: P[...,None,:] - C[None,None,:,:]
+    d2 = np.sum((P[..., None, :] - C[None, None, :, :]) ** 2, axis=-1)
+    idx = np.argmin(d2, axis=-1)  # (Ny,Nx)
 
-    out_labels = np.empty((grid_points.shape[0],), dtype=int)
+    grid_labels = np.zeros_like(idx, dtype=int)
+    for i, b in enumerate(basin_ids):
+        grid_labels[idx == i] = b
 
-    for start in range(0, grid_points.shape[0], chunk):
-        end = min(grid_points.shape[0], start + chunk)
-        pts = grid_points[start:end]
-
-        dists, idxs = nn.kneighbors(pts, return_distance=True)
-        neigh_basins = basin_ids[idxs]  # (M, k)
-        w = 1.0 / (dists + 1e-6)        # inverse-distance weights
-
-        M, kk = neigh_basins.shape
-        score = np.zeros((M, len(unique_basins)), dtype=float)
-
-        for j in range(kk):
-            bj = neigh_basins[:, j].astype(int)
-            wj = w[:, j]
-            # map basin id -> column index
-            col = np.fromiter((basin_to_index[int(b)] for b in bj), count=M, dtype=int)
-            score[np.arange(M), col] += wj
-
-        out_labels[start:end] = unique_basins[np.argmax(score, axis=1)]
-
-    grid_labels = out_labels.reshape((grid_n, grid_n))
     return grid_labels, xs, ys
 
 
-def basin_centroids(df: pd.DataFrame, weight_col: Optional[str]) -> Dict[int, Tuple[float, float]]:
-    cent: Dict[int, Tuple[float, float]] = {}
-    for bid, g in df.groupby("basin_id"):
-        if weight_col and weight_col in g.columns:
-            w = g[weight_col].to_numpy(dtype=float)
-        else:
-            w = np.ones(len(g), dtype=float)
-        w = w / (w.sum() + 1e-12)
-        z1 = float(np.sum(g["z1"].to_numpy(dtype=float) * w))
-        z2 = float(np.sum(g["z2"].to_numpy(dtype=float) * w))
-        cent[int(bid)] = (z1, z2)
-    return cent
+# -----------------------------
+# Basin overlay rendering
+# -----------------------------
+def make_basin_overlay_rgba(
+    grid_labels: np.ndarray,
+    alpha: float = 0.22,
+    blur_sigma: float = 2.2,
+    palette: str = "tab20",
+) -> np.ndarray:
+    """
+    Create an RGBA overlay image for basin regions.
+    Each basin gets a different color; boundaries are softened by blur.
+    """
+    unique_basins = np.unique(grid_labels).astype(int)
+    cmap = plt.get_cmap(palette, max(len(unique_basins), 1))
+
+    H, W = grid_labels.shape
+    overlay = np.zeros((H, W, 4), dtype=float)
+
+    for i, b in enumerate(unique_basins):
+        mask = (grid_labels == b).astype(float)
+        mask = gaussian_blur_2d(mask, sigma=float(blur_sigma))
+
+        mmax = float(mask.max())
+        if mmax > 0:
+            mask = mask / mmax
+
+        r, g, bb, _ = cmap(i)
+        overlay[..., 0] += r * mask * alpha
+        overlay[..., 1] += g * mask * alpha
+        overlay[..., 2] += bb * mask * alpha
+        overlay[..., 3] += mask * alpha
+
+    overlay[..., 3] = np.clip(overlay[..., 3], 0.0, 0.55)
+    overlay[..., 0:3] = np.clip(overlay[..., 0:3], 0.0, 1.0)
+    return overlay
 
 
-# -----------------------------
-# Plot helpers
-# -----------------------------
 def draw_basin_boundaries(ax: plt.Axes, grid_labels: np.ndarray, xs: np.ndarray, ys: np.ndarray):
     unique_basins = np.unique(grid_labels).astype(int)
     extent = [xs[0], xs[-1], ys[0], ys[-1]]
@@ -183,19 +247,54 @@ def draw_basin_boundaries(ax: plt.Axes, grid_labels: np.ndarray, xs: np.ndarray,
         ax.contour(
             mask,
             levels=[0.5],
-            colors="black",
-            linewidths=0.8,
+            colors="white",
+            linewidths=1.2,
+            alpha=0.85,
             origin="lower",
             extent=extent,
         )
 
 
-def plot_density_with_basins(
+# -----------------------------
+# IO helpers
+# -----------------------------
+def detect_weight_column(df: pd.DataFrame) -> Optional[str]:
+    for c in ["weight", "prob", "p_mass", "mass", "occupancy", "count"]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def load_points_with_basin(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = ["z1", "z2", "label", "basin_id"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path.name} missing columns: {missing}")
+
+    df = df.copy()
+    df["label"] = df["label"].astype(str)
+    df["basin_id"] = pd.to_numeric(df["basin_id"], errors="coerce")
+    df = df.dropna(subset=["basin_id"]).copy()
+    df["basin_id"] = df["basin_id"].astype(int)
+
+    df["z1"] = pd.to_numeric(df["z1"], errors="coerce")
+    df["z2"] = pd.to_numeric(df["z2"], errors="coerce")
+    df = df.dropna(subset=["z1", "z2"]).copy()
+
+    return df
+
+
+# -----------------------------
+# Plot: density + frosted basin masks
+# -----------------------------
+def plot_density_with_basins_light(
     df: pd.DataFrame,
     label: str,
     out_png: Path,
     out_pdf: Path,
     title: str,
+    bins: int,
     xlim: Tuple[float, float],
     ylim: Tuple[float, float],
     grid_labels: np.ndarray,
@@ -209,15 +308,19 @@ def plot_density_with_basins(
         raise ValueError(f"No rows for label={label}")
 
     Z = sub[["z1", "z2"]].to_numpy(dtype=float)
+
     if weight_col and weight_col in sub.columns:
-        w = sub[weight_col].to_numpy(dtype=float)
+        w = pd.to_numeric(sub[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if weight_col == "count":
+            w = np.maximum(w, 0.0)
     else:
         w = np.ones(len(sub), dtype=float)
+
     w = w / (w.sum() + 1e-12)
 
     H, xedges, yedges = hist2d_weighted(
         Z, w,
-        bins=DENSITY_BINS,
+        bins=bins,
         xlim=xlim,
         ylim=ylim,
         smooth_sigma=SMOOTH_SIGMA,
@@ -225,83 +328,112 @@ def plot_density_with_basins(
     )
     D = np.log1p(H)
 
-    plt.figure(figsize=(7.2, 6.0))
-    ax = plt.gca()
+    # Contrast for light theme: robust vmax
+    if np.any(D > 0):
+        vmax = float(np.percentile(D[D > 0], 99.3))
+    else:
+        vmax = 1.0
+    vmax = max(vmax, 1e-12)
 
+    fig = plt.figure(figsize=(7.6, 6.2), facecolor="white")
+    ax = plt.gca()
+    ax.set_facecolor("white")
+
+    # 1) density heatmap (light-friendly)
     im = ax.imshow(
         D.T,
         origin="lower",
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
+        cmap=HEATMAP_CMAP,
+        vmin=0.0,
+        vmax=vmax,
+        interpolation="bilinear",
+        zorder=1,
     )
-    plt.colorbar(im, ax=ax, label="log(1 + probability mass)")
+    cb = plt.colorbar(im, ax=ax)
+    cb.set_label("log(1 + probability mass)")
 
+    # 2) basin overlay (semi-transparent + blurred)
+    overlay = make_basin_overlay_rgba(
+        grid_labels=grid_labels,
+        alpha=MASK_ALPHA,
+        blur_sigma=MASK_BLUR_SIGMA,
+        palette=PALETTE,
+    )
+    ax.imshow(
+        overlay,
+        origin="lower",
+        extent=[xs[0], xs[-1], ys[0], ys[-1]],
+        interpolation="bilinear",
+        zorder=2,
+    )
+
+    # 3) subtle "glass veil"
+    ax.add_patch(
+        Rectangle(
+            (xlim[0], ylim[0]),
+            xlim[1] - xlim[0],
+            ylim[1] - ylim[0],
+            facecolor="white",
+            alpha=GLASS_VEIL_ALPHA,
+            edgecolor="none",
+            zorder=3,
+        )
+    )
+
+    # 4) boundaries
     draw_basin_boundaries(ax, grid_labels=grid_labels, xs=xs, ys=ys)
 
+    # 5) basin ids (readable on anything)
     for bid, (cx, cy) in centroids.items():
-        ax.text(cx, cy, str(bid), ha="center", va="center", fontsize=11, color="black")
+        txt = ax.text(
+            cx, cy, str(bid),
+            ha="center", va="center",
+            fontsize=12,
+            color="black",
+            zorder=6,
+        )
+        txt.set_path_effects([pe.withStroke(linewidth=3.0, foreground="white", alpha=0.95)])
 
     ax.set_title(title)
     ax.set_xlabel("Structure axis 1 (t-SNE, Hamming)")
     ax.set_ylabel("Structure axis 2 (t-SNE, Hamming)")
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
+
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+        spine.set_linewidth(0.8)
 
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
     plt.savefig(out_pdf)
-    plt.close()
+    plt.close(fig)
 
 
-def plot_basin_map_with_reps(
-    df_all: pd.DataFrame,
-    reps: pd.DataFrame,
+def plot_basin_legend(
+    basin_ids: List[int],
     out_png: Path,
     out_pdf: Path,
-    title: str,
-    xlim: Tuple[float, float],
-    ylim: Tuple[float, float],
-    grid_labels: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    centroids: Dict[int, Tuple[float, float]],
+    palette: str = "tab20",
 ):
-    plt.figure(figsize=(7.2, 6.0))
+    cmap = plt.get_cmap(palette, max(len(basin_ids), 1))
+    patches = []
+    for i, b in enumerate(basin_ids):
+        r, g, bb, _ = cmap(i)
+        patches.append(Patch(facecolor=(r, g, bb, 0.35), edgecolor="none", label=f"Basin {b}"))
+
+    plt.figure(figsize=(7.6, 2.2), facecolor="white")
     ax = plt.gca()
-
-    # Light pooled background
-    ax.scatter(df_all["z1"], df_all["z2"], s=3, alpha=0.15)
-
-    draw_basin_boundaries(ax, grid_labels=grid_labels, xs=xs, ys=ys)
-
-    for bid, (cx, cy) in centroids.items():
-        ax.text(cx, cy, str(bid), ha="center", va="center", fontsize=11, color="black")
-
-    reps = reps.copy()
-    for col in ["scope", "label", "basin_id", "z1", "z2"]:
-        if col not in reps.columns:
-            raise ValueError(f"representatives.csv missing required column: {col}")
-
-    def _scatter_subset(sub: pd.DataFrame, marker: str, lab: str):
-        if sub.empty:
-            return
-        ax.scatter(sub["z1"], sub["z2"], s=70, marker=marker, label=lab, alpha=0.95)
-
-    within = reps[reps["scope"].astype(str) == "within_label"]
-    global_ = reps[reps["scope"].astype(str) == "global"]
-
-    _scatter_subset(within[within["label"] == "WT"], marker="o", lab="WT reps")
-    _scatter_subset(within[within["label"] == "G12C"], marker="^", lab="G12C reps")
-    _scatter_subset(within[within["label"] == "G12D"], marker="s", lab="G12D reps")
-    _scatter_subset(global_, marker="X", lab="Global reps")
-
-    ax.set_title(title)
-    ax.set_xlabel("Structure axis 1 (t-SNE, Hamming)")
-    ax.set_ylabel("Structure axis 2 (t-SNE, Hamming)")
-    ax.set_xlim(xlim)
-    ax.set_ylim(ylim)
-    ax.legend(frameon=False, loc="best")
-
+    ax.axis("off")
+    ax.legend(
+        handles=patches,
+        ncol=min(6, max(1, len(patches))),
+        frameon=False,
+        loc="center",
+        fontsize=11,
+    )
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
     plt.savefig(out_pdf)
@@ -313,31 +445,15 @@ def plot_basin_map_with_reps(
 # -----------------------------
 def main():
     root = kras_root_from_script()
-
     data_used = root / "data_used"
-    figs_root = root / "figs"
-    out_dir = figs_root / FIG_SUBDIR
+    out_dir = root / "figs" / FIG_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    merged_path = pick_file(data_used, "merged_points_with_basin.csv")
-    reps_path = pick_file(data_used, "representatives.csv")
+    points_path = pick_file(data_used, "merged_points_with_basin.csv")
+    df = load_points_with_basin(points_path)
+    weight_col = detect_weight_column(df)
 
-    df = pd.read_csv(merged_path)
-    reps = pd.read_csv(reps_path)
-
-    required = {"z1", "z2", "label", "basin_id"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"{merged_path.name} missing columns: {sorted(missing)}")
-
-    # optional weight column
-    weight_col = None
-    for cand in ["weight", "p_mass"]:
-        if cand in df.columns:
-            weight_col = cand
-            break
-
-    # shared axis limits
+    # axis limits (global)
     xmin, xmax = float(df["z1"].min()), float(df["z1"].max())
     ymin, ymax = float(df["z2"].min()), float(df["z2"].max())
     padx = 0.05 * (xmax - xmin + 1e-12)
@@ -345,37 +461,34 @@ def main():
     xlim = (xmin - padx, xmax + padx)
     ylim = (ymin - pady, ymax + pady)
 
-    coords = df[["z1", "z2"]].to_numpy(dtype=float)
-    basin_ids = df["basin_id"].to_numpy(dtype=int)
-
-    # Build basin boundary grid once (shared)
-    print(f"[INFO] Using: {merged_path}")
-    print(f"[INFO] Using: {reps_path}")
-    print(f"[INFO] Output dir: {out_dir}")
-    print(f"[INFO] Points: {len(df)} | basins: {len(np.unique(basin_ids))}")
-    print(f"[INFO] Grid: {GRID_N}x{GRID_N} | kNN: k={KNN_K}")
-
-    grid_labels, xs, ys = compute_basin_label_grid(
-        coords=coords,
-        basin_ids=basin_ids,
+    # basins (global centroids)
+    centroids = compute_basin_centroids(df)
+    grid_labels, xs, ys = build_voronoi_grid_labels(
+        centroids=centroids,
         xlim=xlim,
         ylim=ylim,
         grid_n=GRID_N,
-        k=KNN_K,
-        chunk=CHUNK,
     )
-    centroids = basin_centroids(df, weight_col=weight_col)
+    basin_ids_sorted = sorted(centroids.keys())
 
-    # ---- Outputs: three labels ----
-    for i, lab in enumerate(["WT", "G12C", "G12D"], start=1):
-        out_png = out_dir / f"B{i}_basins_overlay_{lab}.png"
-        out_pdf = out_dir / f"B{i}_basins_overlay_{lab}.pdf"
-        plot_density_with_basins(
+    outputs: List[str] = []
+
+    # B1/B2/B3
+    for i, lab in enumerate(TARGET_LABELS, start=1):
+        if not (df["label"] == lab).any():
+            print(f"[WARN] label '{lab}' not found in merged_points_with_basin.csv, skip.")
+            continue
+
+        out_png = out_dir / f"B{i}_density_with_basins_{lab}.png"
+        out_pdf = out_dir / f"B{i}_density_with_basins_{lab}.pdf"
+
+        plot_density_with_basins_light(
             df=df,
             label=lab,
             out_png=out_png,
             out_pdf=out_pdf,
-            title=f"{lab} density with basin boundaries",
+            title=f"{lab} density with basin masks",
+            bins=BINS,
             xlim=xlim,
             ylim=ylim,
             grid_labels=grid_labels,
@@ -384,52 +497,43 @@ def main():
             centroids=centroids,
             weight_col=weight_col,
         )
+        outputs += [str(out_png), str(out_pdf)]
 
-    # Representatives map
-    rep_png = out_dir / "B4_basins_representatives.png"
-    rep_pdf = out_dir / "B4_basins_representatives.pdf"
-    plot_basin_map_with_reps(
-        df_all=df,
-        reps=reps,
-        out_png=rep_png,
-        out_pdf=rep_pdf,
-        title="Basin map with representative points",
-        xlim=xlim,
-        ylim=ylim,
-        grid_labels=grid_labels,
-        xs=xs,
-        ys=ys,
-        centroids=centroids,
-    )
+    # B4: legend
+    leg_png = out_dir / "B4_basin_legend.png"
+    leg_pdf = out_dir / "B4_basin_legend.pdf"
+    plot_basin_legend(basin_ids_sorted, leg_png, leg_pdf, palette=PALETTE)
+    outputs += [str(leg_png), str(leg_pdf)]
 
-    # Manifest
+    # manifest
     manifest = out_dir / "B_manifest.json"
     payload = {
         "inputs": {
-            "merged_points_with_basin": str(merged_path),
-            "representatives": str(reps_path),
+            "merged_points_with_basin": str(points_path),
         },
         "params": {
-            "DENSITY_BINS": DENSITY_BINS,
+            "BINS": BINS,
             "SMOOTH_SIGMA": SMOOTH_SIGMA,
             "GRID_N": GRID_N,
-            "KNN_K": KNN_K,
-            "CHUNK": CHUNK,
+            "MASK_ALPHA": MASK_ALPHA,
+            "MASK_BLUR_SIGMA": MASK_BLUR_SIGMA,
+            "PALETTE": PALETTE,
+            "HEATMAP_CMAP": HEATMAP_CMAP,
+            "GLASS_VEIL_ALPHA": GLASS_VEIL_ALPHA,
             "weight_col": weight_col,
-            "FIG_SUBDIR": FIG_SUBDIR,
         },
-        "outputs": [
-            str(out_dir / "B1_basins_overlay_WT.png"),
-            str(out_dir / "B2_basins_overlay_G12C.png"),
-            str(out_dir / "B3_basins_overlay_G12D.png"),
-            str(rep_png),
-        ],
+        "basins": basin_ids_sorted,
+        "outputs": outputs,
+        "notes": {
+            "rendering": "Light background + cividis heatmap + frosted semi-transparent basin masks + white boundaries.",
+            "partition": "Basin regions are Voronoi partitions over basin centroids in embedding space.",
+        },
     }
     with open(manifest, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    print("\n[DONE] Saved to:", out_dir)
-    for p in payload["outputs"]:
+    print("[DONE] Saved to:", out_dir)
+    for p in outputs:
         print("  -", Path(p).name)
     print("  -", manifest.name)
 
