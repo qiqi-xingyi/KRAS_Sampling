@@ -53,10 +53,9 @@ PALETTE = "tab20"
 DRAW_BOUNDARIES = True
 GRID_N = 520                   # boundary grid resolution (higher = smoother but slower)
 KNN_K = 9                       # kNN neighbors (odd number recommended)
-BOUNDARY_COLOR = "#FFFFFF"
-BOUNDARY_LW = 1.5
+BOUNDARY_COLOR = "#000000"
+BOUNDARY_LW = 1.6
 BOUNDARY_ALPHA = 0.95
-
 
 # -----------------------------
 # Path helpers
