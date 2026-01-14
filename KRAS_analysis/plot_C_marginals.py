@@ -522,6 +522,7 @@ def main():
             "Fixed filenames only; overwritten each run.",
         ],
     }
+
     with open(out_dir / "C_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
