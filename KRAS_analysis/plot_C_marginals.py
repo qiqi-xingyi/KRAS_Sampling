@@ -515,6 +515,7 @@ def main():
             "PALETTE": BASIN_PALETTE,
             "weight_col": wcol,
         },
+
         "outputs": [str(p) for p in fixed_outputs],
         "notes": [
             "Main panel is a colored blur: per-basin 2D hist -> Gaussian blur -> RGBA composite using basin colors.",
