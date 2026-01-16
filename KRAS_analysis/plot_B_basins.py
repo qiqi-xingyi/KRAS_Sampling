@@ -2,14 +2,16 @@
 # ------------------------------------------------------------
 # KRAS basin visualization (Plan B - comparable partitions)
 # - Points colored by basin_id (categorical)
-# - Basin boundaries drawn as GLOBAL Voronoi (regular line segments)
-# - The SAME boundaries are used for WT/G12C/G12D for comparability
+# - Basin boundaries: GLOBAL Voronoi (regular line segments), same for WT/G12C/G12D
+# - Boundary style: light blue/gray dashed
+# - Display basin numbers as 1..K (not starting from 0)
+# - Each basin number sits on a darker, same-color circle
 #
 # Input (under KRAS_analysis/data_used):
 #   merged_points_with_basin.csv (or *_merged_points_with_basin.csv)
 #     required columns: z1, z2, label, basin_id
 #
-# Output (overwrite, filenames unchanged):
+# Output (overwrite, fixed filenames):
 #   KRAS_analysis/figs/B_basins/
 #     B1_density_with_basins_WT.png/.pdf
 #     B2_density_with_basins_G12C.png/.pdf
@@ -38,21 +40,28 @@ FIG_SUBDIR = "B_basins"
 TARGET_LABELS = ["WT", "G12C", "G12D"]
 
 SEED = 0
-MAX_POINTS_PER_LABEL = 80000     # scatter subsample for speed; set None to disable
+MAX_POINTS_PER_LABEL = 80000  # scatter subsample for speed; set None to disable
 POINT_SIZE = 10
 POINT_ALPHA = 0.30
 
-# Use a stable categorical palette; colors are assigned by sorted basin_id
+# Stable categorical palette; colors assigned by sorted basin_id
 PALETTE = "tab20"
 
 # Global Voronoi boundary grid (regular segments)
 DRAW_BOUNDARIES = True
-GRID_N = 520
+GRID_N = 560
 
-# BLACK boundaries
-BOUNDARY_COLOR = "#000000"
-BOUNDARY_LW = 1.4
+# Dashed boundary style (light blue/gray)
+BOUNDARY_COLOR = "#a9b8c6"   # light blue-gray
+BOUNDARY_LW = 1.2
 BOUNDARY_ALPHA = 0.95
+BOUNDARY_LS = "--"
+
+# Basin number marker (circle background)
+NUM_CIRCLE_SIZE = 240        # scatter size for the circle
+NUM_FONTSIZE = 12
+NUM_TEXT_COLOR = "#ffffff"
+NUM_CIRCLE_DARKEN = 0.62     # 0..1, smaller -> darker
 
 
 # -----------------------------
@@ -170,6 +179,7 @@ def draw_basin_boundaries(ax: plt.Axes, grid_labels: np.ndarray, xs: np.ndarray,
             levels=[0.5],
             colors=BOUNDARY_COLOR,
             linewidths=BOUNDARY_LW,
+            linestyles=BOUNDARY_LS,
             alpha=BOUNDARY_ALPHA,
             origin="lower",
             extent=extent,
@@ -178,9 +188,28 @@ def draw_basin_boundaries(ax: plt.Axes, grid_labels: np.ndarray, xs: np.ndarray,
 
 
 # -----------------------------
+# Colors & numbering
+# -----------------------------
+def basin_color_map(basin_ids_global: List[int], palette: str) -> Dict[int, Tuple[float, float, float, float]]:
+    cmap = plt.get_cmap(palette, max(len(basin_ids_global), 1))
+    return {b: cmap(i) for i, b in enumerate(basin_ids_global)}
+
+
+def darken_rgba(rgba: Tuple[float, float, float, float], factor: float) -> Tuple[float, float, float, float]:
+    r, g, b, a = rgba
+    f = float(np.clip(factor, 0.0, 1.0))
+    return (r * f, g * f, b * f, a)
+
+
+def build_display_id_map(basin_ids_global: List[int]) -> Dict[int, int]:
+    # map basin_id -> 1..K (sorted order)
+    return {b: i + 1 for i, b in enumerate(basin_ids_global)}
+
+
+# -----------------------------
 # Plotting
 # -----------------------------
-def plot_scatter_by_basin_global_colors(
+def plot_scatter_by_basin_global_partition(
     df_all: pd.DataFrame,
     label: str,
     out_png: Path,
@@ -190,10 +219,12 @@ def plot_scatter_by_basin_global_colors(
     ylim: Tuple[float, float],
     basin_ids_global: List[int],
     color_map: Dict[int, Tuple[float, float, float, float]],
+    display_id_map: Dict[int, int],
     draw_boundaries: bool,
     grid_labels: Optional[np.ndarray],
     xs: Optional[np.ndarray],
     ys: Optional[np.ndarray],
+    centroids_global: Dict[int, Tuple[float, float]],
 ):
     sub = df_all[df_all["label"] == label].copy()
     if sub.empty:
@@ -203,8 +234,7 @@ def plot_scatter_by_basin_global_colors(
     ax = plt.gca()
     ax.set_facecolor("white")
 
-    # points
-    # (iterate global basin order -> stable draw order and stable colors)
+    # points (stable global order & color)
     for b in basin_ids_global:
         part = sub[sub["basin_id"] == b]
         if part.empty:
@@ -224,17 +254,34 @@ def plot_scatter_by_basin_global_colors(
     if draw_boundaries and grid_labels is not None and xs is not None and ys is not None:
         draw_basin_boundaries(ax, grid_labels=grid_labels, xs=xs, ys=ys)
 
-    # basin id labels at GLOBAL centroids (so label positions are comparable too)
-    cent_global = compute_basin_centroids(df_all)  # OK since df_all includes all labels
-    for b, (cx, cy) in cent_global.items():
-        txt = ax.text(
-            cx, cy, str(b),
-            ha="center", va="center",
-            fontsize=12,
-            color="#111111",
+    # basin number markers at GLOBAL centroids (comparable positions)
+    for b in basin_ids_global:
+        if b not in centroids_global:
+            continue
+        cx, cy = centroids_global[b]
+        base = color_map[b]
+        circle_col = darken_rgba(base, NUM_CIRCLE_DARKEN)
+
+        # circle background
+        ax.scatter(
+            [cx], [cy],
+            s=NUM_CIRCLE_SIZE,
+            c=[circle_col],
+            edgecolors="white",
+            linewidths=1.2,
             zorder=10,
         )
-        txt.set_path_effects([pe.withStroke(linewidth=3.0, foreground="white", alpha=0.95)])
+
+        # number text (1..K)
+        disp = display_id_map.get(b, b)
+        t = ax.text(
+            cx, cy, str(disp),
+            ha="center", va="center",
+            fontsize=NUM_FONTSIZE,
+            color=NUM_TEXT_COLOR,
+            zorder=11,
+        )
+        t.set_path_effects([pe.withStroke(linewidth=2.2, foreground="black", alpha=0.12)])
 
     ax.set_title(title)
     ax.set_xlabel("Structure axis 1 (t-SNE, Hamming)")
@@ -253,15 +300,17 @@ def plot_scatter_by_basin_global_colors(
 
 
 def plot_basin_legend(
-    basin_ids: List[int],
+    basin_ids_global: List[int],
     color_map: Dict[int, Tuple[float, float, float, float]],
+    display_id_map: Dict[int, int],
     out_png: Path,
     out_pdf: Path,
 ):
     patches = []
-    for b in basin_ids:
+    for b in basin_ids_global:
         r, g, bb, _ = color_map[b]
-        patches.append(Patch(facecolor=(r, g, bb, 0.75), edgecolor="none", label=f"Basin {b}"))
+        disp = display_id_map.get(b, b)
+        patches.append(Patch(facecolor=(r, g, bb, 0.75), edgecolor="none", label=f"Basin {disp}"))
 
     plt.figure(figsize=(7.8, 2.3), facecolor="white")
     ax = plt.gca()
@@ -329,18 +378,19 @@ def main():
     xlim = (xmin - padx, xmax + padx)
     ylim = (ymin - pady, ymax + pady)
 
-    # Global basin color mapping (stable across labels)
+    # global basin ids and colors (consistent across labels)
     basin_ids_global = sorted(df["basin_id"].unique().tolist())
-    cmap = plt.get_cmap(PALETTE, max(len(basin_ids_global), 1))
-    color_map: Dict[int, Tuple[float, float, float, float]] = {}
-    for i, b in enumerate(basin_ids_global):
-        color_map[b] = cmap(i)
+    color_map = basin_color_map(basin_ids_global, PALETTE)
 
-    # Global Voronoi boundaries (same for all plots)
+    # display id mapping: 1..K (sorted by basin_id)
+    display_id_map = build_display_id_map(basin_ids_global)
+
+    # global centroids (for number positions)
+    centroids_global = compute_basin_centroids(df)
+
+    # global Voronoi boundaries (same for all plots)
     grid_labels = xs = ys = None
     if DRAW_BOUNDARIES:
-        # Use ALL labels to compute global centroids -> most stable partition
-        centroids_global = compute_basin_centroids(df)
         grid_labels, xs, ys = build_voronoi_grid_labels(
             centroids=centroids_global,
             xlim=xlim,
@@ -361,26 +411,28 @@ def main():
             continue
 
         out_png, out_pdf = out_map[lab]
-        plot_scatter_by_basin_global_colors(
+        plot_scatter_by_basin_global_partition(
             df_all=df_plot,
             label=lab,
             out_png=out_png,
             out_pdf=out_pdf,
-            title=f"{lab} basins (comparable global partition)",
+            title=f"{lab} basins (global dashed boundaries, consistent coloring)",
             xlim=xlim,
             ylim=ylim,
             basin_ids_global=basin_ids_global,
             color_map=color_map,
+            display_id_map=display_id_map,
             draw_boundaries=DRAW_BOUNDARIES,
             grid_labels=grid_labels,
             xs=xs,
             ys=ys,
+            centroids_global=centroids_global,
         )
 
     # legend (unchanged filename)
     leg_png = out_dir / "B4_basin_legend.png"
     leg_pdf = out_dir / "B4_basin_legend.pdf"
-    plot_basin_legend(basin_ids_global, color_map, leg_png, leg_pdf)
+    plot_basin_legend(basin_ids_global, color_map, display_id_map, leg_png, leg_pdf)
 
     # manifest (unchanged filename)
     manifest = out_dir / "B_manifest.json"
@@ -396,11 +448,16 @@ def main():
             "GRID_N": GRID_N,
             "BOUNDARY_COLOR": BOUNDARY_COLOR,
             "BOUNDARY_LW": BOUNDARY_LW,
+            "BOUNDARY_LS": BOUNDARY_LS,
+            "NUM_CIRCLE_SIZE": NUM_CIRCLE_SIZE,
+            "NUM_CIRCLE_DARKEN": NUM_CIRCLE_DARKEN,
             "weight_col": weight_col,
+            "display_id_map": display_id_map,
         },
         "notes": {
-            "comparability": "All labels share the same GLOBAL Voronoi basin boundaries (regular line segments).",
-            "colors": "Basin colors are globally mapped by sorted basin_id and are consistent across labels.",
+            "comparability": "All labels share the same GLOBAL Voronoi boundaries (regular line segments).",
+            "boundary_style": "Light blue-gray dashed for readability.",
+            "label_style": "Basin numbers shown as 1..K with darker same-color circle background.",
             "overwrite_policy": "Fixed filenames only; overwritten each run.",
         },
     }
