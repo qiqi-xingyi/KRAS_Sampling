@@ -10,8 +10,6 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-
-# Closed-loop order (prefix numbers will follow this list)
 FILES_USED_ORDERED: List[str] = [
     # 1) Pipeline definition / reproducibility
     "metrics.json",
