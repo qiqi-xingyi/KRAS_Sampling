@@ -1,0 +1,145 @@
+# KRAS Case Study Data Summary (Closed-Loop Evidence Pack)
+
+This folder contains the **minimal closed-loop dataset** used to support the KRAS case study in our paper. The goal is to demonstrate that our **quantum sampling distribution is energy-sensitive**, that it **captures a structured low-dimensional manifold of the fragment conformational landscape**, and that it **responds reproducibly and interpretably to mutations** (WT vs G12C vs G12D).
+
+All results are derived from a single consistent representation of the sampled conformational space: a shared 2D embedding of sampled bitstrings (structure space) plus basin assignments, followed by statistically supported comparisons across conditions.
+
+---
+
+## Overview of the Evidence Chain
+
+Our analysis follows a strict closed loop:
+
+1. **Sampling distribution difference is real and quantifiable.**
+   We embed sampled bitstrings into a shared 2D structure space and measure distribution shifts (e.g., divergence metrics with uncertainty).
+
+2. **The distribution is organized into discrete basins on the manifold.**
+   The embedding is not uniform; it contains recurrent dense regions (basins) that correspond to dominant structural families.
+
+3. **Mutations shift probability mass between basins (occupancy migration).**
+   WT and mutants redistribute sampling probability across basins, producing interpretable occupancy changes.
+
+4. **The basin shifts are energy-consistent (energy sensitivity).**
+   Basins that gain probability mass under a mutation show systematic differences in energy terms relative to WT, connecting distribution changes to physical preference.
+
+5. **Representative structures validate the basin interpretation.**
+   Each basin has representative conformations whose structural similarity and RMSD statistics support basin-level structural meaning.
+
+This chain yields an interpretable story: **mutations induce reproducible distribution migration across a structured manifold, aligned with energy contrast and validated by representative structures.**
+
+---
+
+## Core Files and What They Represent
+
+### 1) Global metrics and robustness
+
+**`01_metrics.json`**
+High-level metrics summarizing distribution differences between WT and mutants, including divergence values computed on a shared embedding grid. This file provides the top-level “difference exists” statement in a compact, report-ready format.
+
+**`02_metrics_bootstrap.csv`**
+Bootstrap estimates of distribution-level metrics (e.g., divergence, summary differences) across resampled subsets. This captures uncertainty and supports statistical credibility beyond a single run.
+
+**`03_metrics_stability_by_seed.csv`**
+Stability/robustness of distribution metrics across embedding or analysis seeds (when applicable). This demonstrates that the observed distribution shift is not an artifact of a single random initialization.
+
+**What these files show:**
+Distribution shifts between WT and mutants are **quantifiable**, **statistically supported**, and **robust**.
+
+---
+
+### 2) Shared structure-space points and basin assignments
+
+**`04_merged_points_with_basin.csv`**
+The master table for the closed loop. It includes the shared 2D coordinates (embedding axes), the condition label (WT/G12C/G12D), per-point weights (probability mass), and the assigned `basin_id`. Every downstream basin/occupancy/energy plot is derived from this table.
+
+**What this file enables:**
+A consistent coordinate system ensures that WT and mutants are directly comparable in the same manifold. Basin assignment provides the discrete structure needed for basin-level statistics.
+
+---
+
+### 3) Basin occupancy and mutation-driven migration
+
+**`05_basin_occupancy.csv`**
+Per-condition basin occupancies (probability mass per basin). This is the canonical “where the sampling probability goes” summary.
+
+**`06_basin_delta_summary.csv`**
+A compact summary of occupancy changes relative to WT (e.g., Δoccupancy for each basin), ranking basins by change magnitude and enabling direct narrative building.
+
+**`07_occupancy_delta_ci.csv`**
+Confidence intervals for basin occupancy changes (e.g., bootstrap CI for Δoccupancy). This provides statistical support that key basin shifts are not noise-level fluctuations.
+
+**What these files show:**
+Mutations cause **structured, basin-level migration** of sampling probability, with **quantified uncertainty**.
+
+---
+
+### 4) Basin energy sensitivity and physical consistency
+
+**`08_basin_energy_contrast.csv`**
+Per-basin energy contrasts across conditions and/or energy-term breakdown summaries. This file connects basin occupancy shifts to a physical explanation: basins that become more populated under a mutation correspond to favorable energy changes (or specific term shifts).
+
+**What this file shows:**
+The distribution is **energy-sensitive**: probability mass concentrates in basins consistent with energy preference, and mutation-driven migration aligns with energy contrast.
+
+---
+
+### 5) Narrative-ready basin ranking and key story basins
+
+**`09_key_basin_story.csv`**
+A curated subset of basins that form the main interpretability thread (e.g., major WT basins, basins that appear/disappear, or basins with the strongest migration).
+
+**`10_key_basin_story_ranked.csv`**
+The same story set ranked by importance (e.g., combined score using occupancy change, CI significance, energy contrast magnitude). This is designed to map cleanly into figure captions and results text.
+
+**What these files show:**
+They translate raw statistics into a **readable basin-level mechanism**: which basins matter, how they shift, and why they matter.
+
+---
+
+### 6) Representative structures and structural validation
+
+**`11_representatives.csv`**
+Representative conformations per basin (typically the highest-weight or most central structures). These are the concrete structures used for visualization and structural interpretation.
+
+**`12_rep_ca_rmsd.csv`**
+RMSD statistics for representative structures (e.g., CA RMSD between representative and reference, or within-basin structural consistency indicators). This validates that basins correspond to coherent structural families and that key basins are structurally meaningful.
+
+**`13_basin_stats.csv`**
+General basin statistics such as basin size, weight summaries, and optional spread/compactness measures. This supports statements about basin quality (e.g., dominant vs minor basins, compact vs diffuse basins).
+
+**What these files show:**
+Basins correspond to **structurally coherent** groups, and representative conformations provide interpretable structural anchors for each basin.
+
+---
+
+## Data Characteristics and Interpretation Guidance
+
+* **Single source of truth:** `merged_points_with_basin.csv` is the canonical merged representation. All occupancy and basin plots should be derived from this file to keep the closed loop consistent.
+
+* **Comparability across conditions:** WT/G12C/G12D share the same embedding axes, enabling direct geometric comparison. Basin color/ID mappings should remain consistent across figures.
+
+* **Occupancy as probability mass:** Basin occupancy is interpreted as the fraction of sampling probability mass assigned to a basin, not merely raw counts.
+
+* **Uncertainty-aware conclusions:** Any statement about “basin increases/decreases” should be supported using `occupancy_delta_ci.csv` or bootstrap summaries.
+
+* **Energy sensitivity linkage:** Basin migration becomes meaningful when paired with `basin_energy_contrast.csv`, which provides the physical directionality behind the sampling shift.
+
+---
+
+## Practical Use in Figures
+
+Typical figure mapping (paper-level organization):
+
+* **Distribution difference (global):** use `01_metrics.json`, `02_metrics_bootstrap.csv`, `03_metrics_stability_by_seed.csv`
+* **Manifold + basin visualization:** use `04_merged_points_with_basin.csv`
+* **Occupancy migration:** use `05_basin_occupancy.csv`, `06_basin_delta_summary.csv`, `07_occupancy_delta_ci.csv`
+* **Energy consistency:** use `08_basin_energy_contrast.csv`
+* **Story basins:** use `09_key_basin_story.csv`, `10_key_basin_story_ranked.csv`
+* **Representative structural validation:** use `11_representatives.csv`, `12_rep_ca_rmsd.csv`, `13_basin_stats.csv`
+
+---
+
+## Bottom-Line Result Statement
+
+Collectively, these files establish that our quantum sampling pipeline produces a **structured conformational manifold**, decomposable into **interpretable basins**, and that **mutations drive statistically supported basin-to-basin probability migration** that is **consistent with basin-level energy contrast** and **validated by representative structural anchors**.
+This forms a complete closed-loop argument for **energy-sensitive, mutation-responsive quantum sampling** on the KRAS fragment case study.
