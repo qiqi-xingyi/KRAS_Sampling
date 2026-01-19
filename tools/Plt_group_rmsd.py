@@ -55,10 +55,10 @@ import matplotlib.pyplot as plt
 
 # Display labels
 METHODS: List[Tuple[str, str]] = [
-    ("our_rmsd",        "our"),
-    ("colabfold_rmsd",  "colabfold"),
-    ("af3_rmsd",        "af3"),
-    ("vqe_rmsd",        "vqe"),
+    ("our_rmsd",        "QSR"),
+    ("colabfold_rmsd",  "Colabfold"),
+    ("af3_rmsd",        "AF3"),
+    ("vqe_rmsd",        "VQE"),
 ]
 
 # Your palette (requested)
