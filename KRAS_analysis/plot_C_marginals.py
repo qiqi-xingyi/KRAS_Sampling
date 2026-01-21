@@ -352,7 +352,7 @@ def plot_one_panel(
     cent = sub_scatter.groupby("basin_id")[["z1", "z2"]].mean()
     for b, row in cent.iterrows():
         t = ax_main.text(
-            float(row["z1"]), float(row["z2"]), str(int(b)),
+            float(row["z1"]), float(row["z2"]), str(int(b)+1),
             ha="center", va="center",
             fontsize=11,
             color="#111111",
