@@ -29,11 +29,13 @@ METHOD_META = {
 }
 
 # Legend / bar labels use abbreviations (ALL CAPS)
+# NOTE: Only change requested:
+# - In grouped bar, keep QSR next to VQE, then other methods.
 METHODS: List[Tuple[str, str]] = [
     ("qsr_rmsd",        METHOD_META["qsr_rmsd"]["abbr"]),
+    ("vqe_rmsd",        METHOD_META["vqe_rmsd"]["abbr"]),
     ("colabfold_rmsd",  METHOD_META["colabfold_rmsd"]["abbr"]),
     ("af3_rmsd",        METHOD_META["af3_rmsd"]["abbr"]),
-    ("vqe_rmsd",        METHOD_META["vqe_rmsd"]["abbr"]),
 ]
 
 # Your palette (requested)
@@ -81,7 +83,8 @@ FIG1_LEGEND_OUTSIDE = False
 FIG1_LEGEND_NCOL = 4
 
 # ----------------------------
-# Fig2: Delta box + jitter (journal-style)
+# Fig2: Delta violin + jitter (journal-style)
+# (was: box + jitter)
 # ----------------------------
 DELTA_ORDER: List[Tuple[str, str]] = [
     ("colabfold_rmsd", f"{METHOD_META['colabfold_rmsd']['abbr']} − QSR"),
@@ -96,6 +99,7 @@ JITTER_WIDTH = 0.08
 JITTER_POINT_SIZE = 24
 JITTER_POINT_ALPHA = 0.75
 
+# Kept (for compatibility; some are unused by violin but not removed)
 BOX_WIDTH = 0.55
 BOX_EDGE_LINEWIDTH = 1.0
 WHISKER_LINEWIDTH = 1.0
@@ -116,6 +120,13 @@ MEDIAN_TEXT_COLOR = "#111111"
 
 FIG2_TITLE = "ΔRMSD relative to QSR"
 FIG2_YLABEL = "ΔRMSD (Å)"
+
+# Violin style (new but minimal)
+VIOLIN_WIDTH = 0.72
+VIOLIN_EDGE_LINEWIDTH = 1.0
+VIOLIN_ALPHA = 0.22
+VIOLIN_SHOW_MEAN = False
+VIOLIN_SHOW_MEDIAN = True  # keep a crisp center reference
 
 # ----------------------------
 # FigS1: Scatter triplet (method C annotations)
@@ -342,7 +353,7 @@ def plot_fig1_grouped_bar(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
 
 # ============================================================
-# Plot: Fig2 delta RMSD (baseline - QSR) box + jitter
+# Plot: Fig2 delta RMSD (baseline - QSR) violin + jitter
 # ============================================================
 
 def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
@@ -367,33 +378,30 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
 
     fig, ax = plt.subplots(figsize=(8.0, 4.9))
 
-    bp = ax_boxplot_compat(
-        ax,
+    # --- Violin plot (replaces boxplot) ---
+    positions = np.arange(1, len(deltas) + 1, dtype=float)
+    vp = ax.violinplot(
         deltas,
-        labels=tick_labels,
-        showfliers=SHOW_OUTLIERS,
-        patch_artist=True,
-        widths=BOX_WIDTH,
+        positions=positions,
+        widths=VIOLIN_WIDTH,
+        showmeans=VIOLIN_SHOW_MEAN,
+        showmedians=VIOLIN_SHOW_MEDIAN,
+        showextrema=False,
     )
 
-    for box, c in zip(bp["boxes"], colors):
-        box.set_facecolor(c)
-        box.set_alpha(BOX_FACE_ALPHA)
-        box.set_linewidth(BOX_EDGE_LINEWIDTH)
-        box.set_edgecolor(BOX_EDGE_COLOR)
+    # style violins
+    for body, c in zip(vp["bodies"], colors):
+        body.set_facecolor(c)
+        body.set_edgecolor(BOX_EDGE_COLOR)
+        body.set_linewidth(VIOLIN_EDGE_LINEWIDTH)
+        body.set_alpha(VIOLIN_ALPHA)
 
-    for median in bp["medians"]:
-        median.set_linewidth(MEDIAN_LINEWIDTH)
-        median.set_color(BOX_EDGE_COLOR)
+    # style median line if present
+    if "cmedians" in vp:
+        vp["cmedians"].set_color(BOX_EDGE_COLOR)
+        vp["cmedians"].set_linewidth(MEDIAN_LINEWIDTH)
 
-    for whisker in bp["whiskers"]:
-        whisker.set_linewidth(WHISKER_LINEWIDTH)
-        whisker.set_color(BOX_EDGE_COLOR)
-
-    for cap in bp["caps"]:
-        cap.set_linewidth(CAP_LINEWIDTH)
-        cap.set_color(BOX_EDGE_COLOR)
-
+    # jitter points
     for i, (delta, c) in enumerate(zip(deltas, colors), start=1):
         jitter = rng.uniform(-JITTER_WIDTH, JITTER_WIDTH, size=len(delta))
         ax.scatter(
@@ -426,6 +434,9 @@ def plot_fig2_delta_box_jitter(df: pd.DataFrame, out_png: Path, out_pdf: Path):
         color=ZERO_LINE_COLOR,
         zorder=2,
     )
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(tick_labels)
 
     ax.set_ylabel(FIG2_YLABEL)
     ax.set_title(FIG2_TITLE)
@@ -589,10 +600,11 @@ def main():
         out_pdf=out_dir / "fig1_grouped_bar.pdf",
     )
 
+    # NOTE: function name kept to avoid touching other code paths
     plot_fig2_delta_box_jitter(
         df,
-        out_png=out_dir / "fig2_delta_box_jitter.png",
-        out_pdf=out_dir / "fig2_delta_box_jitter.pdf",
+        out_png=out_dir / "fig2_delta_violin_jitter.png",
+        out_pdf=out_dir / "fig2_delta_violin_jitter.pdf",
     )
 
     if ENABLE_SCATTER_TRIPLET:
