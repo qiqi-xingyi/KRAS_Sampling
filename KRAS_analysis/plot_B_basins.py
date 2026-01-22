@@ -416,7 +416,7 @@ def main():
             label=lab,
             out_png=out_png,
             out_pdf=out_pdf,
-            title=f"{lab} basins (global dashed boundaries, consistent coloring)",
+            title=f"{lab} basins",
             xlim=xlim,
             ylim=ylim,
             basin_ids_global=basin_ids_global,
