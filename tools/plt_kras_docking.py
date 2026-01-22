@@ -6,13 +6,6 @@
 #
 # Docking visualization (per target, no cross-target comparison)
 # Panel A only: Energy waterfall / rank plot
-# - For each target_group_key:
-#     parse all docking_result/30_dock/<target>/runs/seed_*/log.txt
-#     extract affinities for ALL modes (default: mode 1..20)
-#     sort affinities ascending (more negative = better)
-#     plot rank vs affinity with line + points
-#     draw median + Q1/Q3 horizontal lines
-#     annotate best affinity + its seed/mode
 #
 # Input:
 #   <project_root>/docking_result/40_pipeline/pipeline_summary.csv
@@ -22,17 +15,17 @@
 # Output:
 #   <project_root>/docking_result/figs_docking_per_target/
 #     D_A_waterfall_<target_group_key>.png/.pdf   (dpi=600)
-#   <project_root>/docking_result/figs_docking_per_target/waterfall_manifest.csv
+#     waterfall_manifest.csv
 #
-# Notes:
-# - This script intentionally does NOT compare different targets on the same axis.
-# - If some seeds are missing logs, they are skipped.
+# Why previous version failed:
+# - Vina header splits "mode/affinity" and "rmsd" across two lines.
+# - We now enter the table after the dashed separator line "-----+...".
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -43,7 +36,6 @@ import matplotlib.pyplot as plt
 # Config
 # -----------------------------
 DPI = 600  # REQUIRED
-
 FIGSIZE = (7.6, 4.8)
 
 GRID_COLOR = "#D9D9D9"
@@ -68,8 +60,13 @@ ANNOT_FONTSIZE = 10
 # Limit to first K modes per seed; set None to parse all table rows
 MAX_MODES_PER_SEED: Optional[int] = None  # e.g., 20
 
-# Filename safety
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+# Matches numeric rows in the Vina table:
+#    1       -7.943          0          0
+TABLE_ROW_RE = re.compile(
+    r"^\s*(\d+)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*$"
+)
 
 
 # -----------------------------
@@ -106,17 +103,15 @@ def safe_filename(name: str) -> str:
 
 
 # -----------------------------
-# Vina log parsing
+# Vina log parsing (FIXED)
 # -----------------------------
-TABLE_ROW_RE = re.compile(
-    r"^\s*(\d+)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*$"
-)
-
 def parse_vina_log_table(log_path: Path) -> List[Dict[str, float]]:
     """
-    Parse the Vina result table:
+    Parse AutoDock Vina log.txt and extract the result table:
       mode | affinity | rmsd l.b. | rmsd u.b.
-    Returns list of dicts with mode, affinity, rmsd_lb, rmsd_ub
+    Robust strategy:
+      - start parsing ONLY after the dashed separator line containing '-----+'
+      - then collect any rows matching: mode affinity lb ub
     """
     if not log_path.exists():
         return []
@@ -126,21 +121,22 @@ def parse_vina_log_table(log_path: Path) -> List[Dict[str, float]]:
     except Exception:
         return []
 
-    rows: List[Dict[str, float]] = []
-    in_table = False
-    for ln in lines:
-        s = ln.rstrip("\n")
-        # detect header line
-        if "mode" in s.lower() and "affinity" in s.lower() and "rmsd" in s.lower():
-            in_table = True
-            continue
-        if not in_table:
-            continue
+    # Find the separator line that precedes numeric rows
+    start_idx = None
+    for i, ln in enumerate(lines):
+        if "-----+" in ln:
+            start_idx = i + 1
+            break
 
+    if start_idx is None:
+        return []
+
+    rows: List[Dict[str, float]] = []
+    for ln in lines[start_idx:]:
+        s = ln.rstrip("\n")
         m = TABLE_ROW_RE.match(s)
         if not m:
-            # stop when leaving table
-            # (after table, vina prints blank line or something else)
+            # stop when we have started collecting and then hit a blank line
             if rows and s.strip() == "":
                 break
             continue
@@ -159,18 +155,17 @@ def parse_vina_log_table(log_path: Path) -> List[Dict[str, float]]:
 
 def collect_target_from_logs(root: Path, target_group_key: str) -> pd.DataFrame:
     """
-    Collect all modes from all seeds for one target, from logs:
+    Collect all modes from all seeds for one target:
       docking_result/30_dock/<target>/runs/seed_*/log.txt
-    Output columns: target, seed, mode, affinity, rmsd_lb, rmsd_ub, log_path
     """
     base = root / "docking_result" / "30_dock" / target_group_key / "runs"
     if not base.exists():
         return pd.DataFrame(columns=["target", "seed", "mode", "affinity", "rmsd_lb", "rmsd_ub", "log_path"])
 
     all_rows: List[Dict[str, object]] = []
-    for seed_dir in sorted(base.glob("seed_*")):
-        if not seed_dir.is_dir():
-            continue
+    seed_dirs = sorted([p for p in base.glob("seed_*") if p.is_dir()])
+
+    for seed_dir in seed_dirs:
         seed = seed_dir.name.replace("seed_", "")
         log_path = seed_dir / "log.txt"
         rows = parse_vina_log_table(log_path)
@@ -194,15 +189,10 @@ def collect_target_from_logs(root: Path, target_group_key: str) -> pd.DataFrame:
 # Plot (Waterfall)
 # -----------------------------
 def plot_waterfall(df: pd.DataFrame, title: str, out_png: Path, out_pdf: Path) -> Dict[str, object]:
-    """
-    df must contain: affinity, seed, mode
-    Returns summary stats for manifest.
-    """
     if df.empty:
         return {"ok": False}
 
-    d = df.copy()
-    d = d.dropna(subset=["affinity"]).copy()
+    d = df.dropna(subset=["affinity"]).copy()
     if d.empty:
         return {"ok": False}
 
@@ -211,8 +201,9 @@ def plot_waterfall(df: pd.DataFrame, title: str, out_png: Path, out_pdf: Path) -
     d["rank"] = np.arange(1, len(d) + 1, dtype=int)
 
     a = d["affinity"].to_numpy(float)
-    best_aff = float(a.min())
-    best_row = d.iloc[int(np.argmin(a))]
+    best_idx = int(np.argmin(a))
+    best_aff = float(a[best_idx])
+    best_row = d.iloc[best_idx]
     best_seed = str(best_row["seed"])
     best_mode = int(best_row["mode"])
 
@@ -245,8 +236,9 @@ def plot_waterfall(df: pd.DataFrame, title: str, out_png: Path, out_pdf: Path) -
     ax.axhline(q1,  color=STAT_LINE_COLOR, linestyle=STAT_LINE_STYLE, linewidth=STAT_LINE_WIDTH, alpha=0.75, zorder=1)
     ax.axhline(q3,  color=STAT_LINE_COLOR, linestyle=STAT_LINE_STYLE, linewidth=STAT_LINE_WIDTH, alpha=0.75, zorder=1)
 
-    # Annotation for best
+    # Best marker at rank 1 location (since sorted)
     ax.scatter([1], [best_aff], s=70, marker="D", facecolors="none", edgecolors="#111111", linewidths=1.2, zorder=4)
+
     ax.text(
         0.98,
         0.05,
@@ -300,7 +292,6 @@ def main():
         raise ValueError("pipeline_summary.csv must contain: target_group_key, ligand_resname")
 
     od = out_dir(root)
-
     manifest_rows: List[Dict[str, object]] = []
 
     for _, row in df_sum.iterrows():
@@ -310,11 +301,10 @@ def main():
         df = collect_target_from_logs(root, target)
         if df.empty:
             print(f"[WARN] No logs parsed for target: {target}")
-            manifest_rows.append({"target_group_key": target, "ok": False, "reason": "no_logs"})
+            manifest_rows.append({"target_group_key": target, "ok": False, "reason": "no_rows_after_parse"})
             continue
 
         title = f"{target} ({lig}) docking energy waterfall"
-
         fname = safe_filename(target)
         out_png = od / f"D_A_waterfall_{fname}.png"
         out_pdf = od / f"D_A_waterfall_{fname}.pdf"
@@ -322,15 +312,15 @@ def main():
         info = plot_waterfall(df, title=title, out_png=out_png, out_pdf=out_pdf)
         info["target_group_key"] = target
         info["ligand_resname"] = lig
-
         manifest_rows.append(info)
-        print(f"[SAVE] {out_png.name}")
 
-    # Save manifest
+        print(f"[SAVE] {out_png.name}  (poses={info.get('n_poses')})")
+
     manifest = pd.DataFrame(manifest_rows)
     manifest_path = od / "waterfall_manifest.csv"
     manifest.to_csv(manifest_path, index=False)
-    print("\n[DONE] Saved figures to:", od)
+
+    print("\n[DONE] Saved to:", od)
     print("  -", manifest_path.name)
 
 
