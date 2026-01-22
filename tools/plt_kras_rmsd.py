@@ -33,7 +33,7 @@ from matplotlib.cm import ScalarMappable
 # -----------------------------
 # Config
 # -----------------------------
-FIGSIZE = (10.8, 8.9)
+FIGSIZE = (7.6, 4.8)
 DPI = 600  # REQUIRED
 
 TRACK_ORDER = [("WT", "A"), ("WT", "B"), ("G12C", "A"), ("G12D", "A")]
