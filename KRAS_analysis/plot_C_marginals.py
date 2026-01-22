@@ -1,4 +1,9 @@
-# plot_C_marginals.py
+# --*-- coding:utf-8 --*--
+# @time:1/21/26
+# @Author : Yuqi Zhang
+# @Email : yzhan135@kent.edu
+# @File:plot_C_marginals.py
+#
 # ------------------------------------------------------------
 # C: Colored (basin) blurred map + marginal projections
 # - Main: per-basin 2D histogram -> Gaussian blur -> colored RGBA composite
@@ -6,12 +11,12 @@
 # - Marginals: WT baseline as gray filled curve; mutants overlay colored curve
 #
 # Input:
-#   KRAS_analysis/data_used/*merged_points_with_basin.csv
+#   <this_script_dir>/data_used/*merged_points_with_basin.csv
 #     required: z1, z2, label, basin_id
 #     optional weights: weight/prob/count/mass...
 #
 # Output (overwrite, fixed filenames):
-#   KRAS_analysis/figs/C_marginals/
+#   <this_script_dir>/figs/C_marginals/
 #     C1_marginals_WT.png/.pdf
 #     C2_marginals_G12C.png/.pdf
 #     C3_marginals_G12D.png/.pdf
@@ -67,6 +72,9 @@ MUT_LINE_W = 2.1
 # Performance
 SEED = 0
 MAX_POINTS_FOR_DENSITY_PER_LABEL = 180000  # used for density construction; set None to disable
+
+# Export
+DPI = 600  # ensure high-res output
 
 
 # -----------------------------
@@ -155,7 +163,13 @@ def mutation_line_color(label: str) -> Tuple[float, float, float, float]:
     return plt.matplotlib.colors.to_rgba("#555555")
 
 
-def hist1d_smoothed(x: np.ndarray, w: Optional[np.ndarray], bins: int, xlim: Tuple[float, float], sigma: float) -> Tuple[np.ndarray, np.ndarray]:
+def hist1d_smoothed(
+    x: np.ndarray,
+    w: Optional[np.ndarray],
+    bins: int,
+    xlim: Tuple[float, float],
+    sigma: float,
+) -> Tuple[np.ndarray, np.ndarray]:
     y, edges = np.histogram(x, bins=bins, range=list(xlim), weights=w, density=False)
     y = y.astype(float)
     if y.sum() > 0:
@@ -182,13 +196,8 @@ def build_colored_blur_rgba(
     """
     Returns rgba image (Ny,Nx,4) and xedges,yedges
     """
-    z1 = df_label["z1"].to_numpy(dtype=float)
-    z2 = df_label["z2"].to_numpy(dtype=float)
-
-    # use optional weights only for density mass
+    # use optional weights only for density mass (disabled by default for appearance)
     w = None
-    # weights handled outside: we already subsample by weight; density mass can remain unweighted for appearance
-    # If you want, you can restore weighted histogram here.
 
     # common grid
     xedges = np.linspace(xlim[0], xlim[1], bins + 1, dtype=float)
@@ -197,8 +206,6 @@ def build_colored_blur_rgba(
     # composite buffer
     rgba = np.zeros((bins, bins, 4), dtype=float)
 
-    # per-basin blurred densities
-    # normalize each basin by its own max (stable blob visibility), then alpha-power
     for b in basin_ids_global:
         part = df_label[df_label["basin_id"] == b]
         if part.empty:
@@ -215,9 +222,8 @@ def build_colored_blur_rgba(
         m = float(H.max())
         if m <= 0:
             continue
-        Hn = H / (m + 1e-12)  # [0,1]
+        Hn = H / (m + 1e-12)
 
-        # alpha shaping
         A = np.power(Hn, ALPHA_POWER)
         A = np.clip(A, 0.0, ALPHA_MAX)
 
@@ -229,23 +235,18 @@ def build_colored_blur_rgba(
         layer[..., 3] = A
 
         if COMPOSITE_MODE == "max":
-            # per-channel "over" approx: keep max alpha and corresponding color mass (simple)
-            # better: alpha-composite; but max gives crisp basin identity
             mask = layer[..., 3] > rgba[..., 3]
             rgba[mask, 0] = layer[mask, 0]
             rgba[mask, 1] = layer[mask, 1]
             rgba[mask, 2] = layer[mask, 2]
             rgba[mask, 3] = layer[mask, 3]
         else:
-            # additive blending with alpha accumulation (looks like colorful heat)
             rgba[..., 0] += layer[..., 0] * layer[..., 3]
             rgba[..., 1] += layer[..., 1] * layer[..., 3]
             rgba[..., 2] += layer[..., 2] * layer[..., 3]
             rgba[..., 3] += layer[..., 3] * 0.85
 
-    # clamp & normalize color by alpha to avoid overbright
     rgba[..., 3] = np.clip(rgba[..., 3], 0.0, 1.0)
-    # avoid division by zero
     denom = np.clip(rgba[..., 3][..., None], 1e-6, 1.0)
     rgba[..., 0:3] = np.clip(rgba[..., 0:3] / denom, 0.0, 1.0)
 
@@ -275,7 +276,6 @@ def plot_one_panel(
     if sub_scatter.empty or sub_density.empty:
         raise ValueError(f"No data for label={label}")
 
-    # WT baseline for marginals uses FULL WT
     wt = df_wt_full.copy()
 
     # weights (marginals)
@@ -309,7 +309,14 @@ def plot_one_panel(
 
     # Layout
     fig = plt.figure(figsize=FIGSIZE, facecolor="white")
-    gs = GridSpec(2, 2, height_ratios=[1.15, 5.0], width_ratios=[5.0, 1.15], hspace=0.05, wspace=0.05)
+    gs = GridSpec(
+        2,
+        2,
+        height_ratios=[1.15, 5.0],
+        width_ratios=[5.0, 1.15],
+        hspace=0.05,
+        wspace=0.05,
+    )
     ax_top = fig.add_subplot(gs[0, 0])
     ax_main = fig.add_subplot(gs[1, 0])
     ax_right = fig.add_subplot(gs[1, 1])
@@ -320,10 +327,10 @@ def plot_one_panel(
             sp.set_color(AX_SPINE_COLOR)
             sp.set_linewidth(0.8)
 
-    # Main: show colored RGBA "blob" (this is the key change)
+    # Main: colored RGBA blob
     extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
     ax_main.imshow(
-        rgba.transpose(1, 0, 2),  # histogram2d uses x-y; align with extent
+        rgba.transpose(1, 0, 2),
         origin="lower",
         extent=extent,
         aspect="auto",
@@ -331,7 +338,7 @@ def plot_one_panel(
         zorder=1,
     )
 
-    # Optional texture scatter (very light)
+    # Optional texture scatter
     if OVERLAY_SCATTER and not sub_scatter.empty:
         for b in basin_ids_global:
             part = sub_scatter[sub_scatter["basin_id"] == b]
@@ -348,15 +355,18 @@ def plot_one_panel(
                 zorder=3,
             )
 
-    # Basin id labels (helps reading)
+    # Basin id labels: shift 0-6 -> 1-7 (display only)
     cent = sub_scatter.groupby("basin_id")[["z1", "z2"]].mean()
     for b, row in cent.iterrows():
         t = ax_main.text(
-            float(row["z1"]), float(row["z2"]), str(int(b)+1),
-            ha="center", va="center",
+            float(row["z1"]),
+            float(row["z2"]),
+            str(int(b) + 1),
+            ha="center",
+            va="center",
             fontsize=11,
             color="#111111",
-            zorder=6
+            zorder=6,
         )
         t.set_path_effects([pe.withStroke(linewidth=3.0, foreground="white", alpha=0.9)])
 
@@ -364,7 +374,10 @@ def plot_one_panel(
     ax_main.set_ylim(ylim)
     ax_main.set_xlabel("Structure axis 1 (t-SNE, Hamming)")
     ax_main.set_ylabel("Structure axis 2 (t-SNE, Hamming)")
-    ax_main.set_title(f"{label} colored basin blur + marginal projections")
+
+    # Title: use suptitle to avoid overlap with top marginal
+    title = f"{label} colored basin blur + marginal projections"
+    fig.suptitle(title, y=0.985, fontsize=12)
 
     # Top marginal (X)
     ax_top.fill_between(cx, 0, yx_wt, color="#666666", alpha=WT_FILL_ALPHA, linewidth=0.0)
@@ -391,8 +404,9 @@ def plot_one_panel(
     if label != "WT":
         ax_top.legend(frameon=False, loc="upper right", fontsize=10)
 
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
+    # Reserve space for suptitle
+    plt.tight_layout(rect=[0, 0, 1, 0.965])
+    plt.savefig(out_png, dpi=DPI)
     plt.savefig(out_pdf)
     plt.close(fig)
 
@@ -403,7 +417,6 @@ def main():
     out_dir = root / "figs" / "C_marginals"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # overwrite-only (fixed filenames)
     fixed_outputs = [
         out_dir / "C1_marginals_WT.png",
         out_dir / "C1_marginals_WT.pdf",
@@ -447,7 +460,7 @@ def main():
         parts_scatter.append(sub)
     df_scatter = pd.concat(parts_scatter, ignore_index=True) if parts_scatter else df
 
-    # Density subset (can be larger)
+    # Density subset
     parts_density = []
     for lab in TARGET_LABELS:
         sub = df[df["label"] == lab].copy()
@@ -457,7 +470,7 @@ def main():
         parts_density.append(sub)
     df_density = pd.concat(parts_density, ignore_index=True) if parts_density else df
 
-    # global limits for comparability
+    # Global limits
     xmin, xmax = float(df_density["z1"].min()), float(df_density["z1"].max())
     ymin, ymax = float(df_density["z2"].min()), float(df_density["z2"].max())
     padx = 0.05 * (xmax - xmin + 1e-12)
@@ -465,7 +478,7 @@ def main():
     xlim = (xmin - padx, xmax + padx)
     ylim = (ymin - pady, ymax + pady)
 
-    # global basin colors (consistent with B)
+    # Global basin colors
     basin_ids_global = sorted(df["basin_id"].unique().tolist())
     bmap = basin_color_map(basin_ids_global)
 
@@ -514,12 +527,14 @@ def main():
             "MAX_SCATTER_POINTS_PER_LABEL": MAX_SCATTER_POINTS_PER_LABEL,
             "PALETTE": BASIN_PALETTE,
             "weight_col": wcol,
+            "DPI": DPI,
         },
-
         "outputs": [str(p) for p in fixed_outputs],
         "notes": [
             "Main panel is a colored blur: per-basin 2D hist -> Gaussian blur -> RGBA composite using basin colors.",
             "Marginals: WT baseline gray filled; mutants overlay colored curves.",
+            "Basin IDs are displayed as (basin_id + 1) to show 1-7 instead of 0-6.",
+            "Title placed as figure suptitle to avoid overlapping the top marginal panel.",
             "Fixed filenames only; overwritten each run.",
         ],
     }
