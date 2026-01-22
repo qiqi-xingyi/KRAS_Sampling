@@ -3,7 +3,7 @@
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:plot_docking_waterfall_per_target.py
-#
+
 # Docking visualization (per target, no cross-target comparison)
 # Panel A only: Energy waterfall / rank plot
 #
