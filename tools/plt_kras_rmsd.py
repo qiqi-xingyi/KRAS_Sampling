@@ -33,7 +33,7 @@ from matplotlib.cm import ScalarMappable
 # Config
 # -----------------------------
 FIGSIZE = (10.8, 4.9)
-DPI = 300
+DPI = 600
 
 TRACK_ORDER = [("WT", "A"), ("WT", "B"), ("G12C", "A"), ("G12D", "A")]  # desired layout
 LABEL_ORDER = ["WT", "G12C", "G12D"]
